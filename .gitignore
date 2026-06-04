@@ -1,5 +1,45 @@
-# 忽略 grbl 文件夹
+# ========================
+# C/C++ & CMake 编译产物
+# ========================
+# 忽略所有的 build 目录（无论在哪个子文件夹下）
+**/build/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/CMakeScripts/
+**/Testing/
+**/Makefile
+**/cmake_install.cmake
+**/compile_commands.json
+
+# 忽略编译生成的对象文件和二进制文件
+*.o
+*.obj
+*.out
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+
+# ========================
+# 依赖和第三方库
+# ========================
 grbl-1.1h.20190825/
 
-# 忽略构建输出目录（相对路径，使用正斜杠）
-SCARA_F103/build/
+# ========================
+# IDE & 编辑器配置
+# ========================
+# VSCode (一般保留 settings.json 和 launch.json 以便协作，忽略个人的缓存)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ========================
+# 操作系统缓存
+# ========================
+.DS_Store
+Thumbs.db
+
+SOURCE/
