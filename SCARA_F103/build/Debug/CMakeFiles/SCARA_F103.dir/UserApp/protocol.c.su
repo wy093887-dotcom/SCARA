@@ -1,7 +1,0 @@
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:25:13:upper_token	24	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:33:6:Protocol_Init	4	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:42:6:Protocol_Loop	4	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:46:6:Protocol_SendStatus	320	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:84:13:send_errors	144	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:98:6:Protocol_ProcessLine	280	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/protocol.c:196:6:Protocol_Tick1kHz	8	static

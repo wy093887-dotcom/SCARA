@@ -1,7 +1,0 @@
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:16:6:ScaraKinematics_Init	4	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:20:14:clamp_f	24	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:31:13:joint_in_range	16	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:46:6:ScaraKinematics_JointToPulse	208	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:66:6:ScaraKinematics_PulseToJoint	144	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:85:6:ScaraKinematics_InverseUm	104	static
-C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/scara_kinematics.c:127:6:ScaraKinematics_Forward	128	static

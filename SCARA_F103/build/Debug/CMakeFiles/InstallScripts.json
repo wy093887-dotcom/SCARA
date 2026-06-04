@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/Users/22602/Desktop/SCARA/SCARA_F103/build/Debug/cmake_install.cmake",
-		"C:/Users/22602/Desktop/SCARA/SCARA_F103/build/Debug/cmake/stm32cubemx/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
