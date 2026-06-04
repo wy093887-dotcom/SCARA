@@ -9,7 +9,7 @@
 
 /* Firmware identity shown by VERSION. */
 #define APP_FW_NAME "SCARA_F103"
-#define APP_FW_VERSION "0.24.0"
+#define APP_FW_VERSION "0.24.1"
 
 /* Current controller drives two stepper axes. */
 #define APP_AXIS_COUNT 2u
@@ -49,8 +49,8 @@
 #define APP_MOTOR1_DIR_SIGN 1L
 #define APP_MOTOR2_DIR_SIGN 1L
 /* Joint zero offsets in mrad after homing / mechanical calibration. */
-#define APP_MOTOR1_ZERO_MRAD 233L
-#define APP_MOTOR2_ZERO_MRAD 2908L
+#define APP_MOTOR1_ZERO_MRAD 2251L
+#define APP_MOTOR2_ZERO_MRAD 890L
 
 /* SCARA geometry in micrometers.
  * Must match the upper computer kinematic model.
@@ -69,8 +69,8 @@
 #define APP_SCARA_THETA2_MIN_MRAD 0L
 #define APP_SCARA_THETA2_MAX_MRAD 6283L
 /* Elbow branch selection for inverse kinematics. Usually keep paired with UI. */
-#define APP_SCARA_IK_LEFT_ELBOW_SIGN (-1)
-#define APP_SCARA_IK_RIGHT_ELBOW_SIGN 1
+#define APP_SCARA_IK_LEFT_ELBOW_SIGN 1
+#define APP_SCARA_IK_RIGHT_ELBOW_SIGN (-1)
 
 /* Legacy stream/status pacing period. */
 #define APP_STREAM_PERIOD_MS 100u
@@ -133,6 +133,6 @@
 /* Magic tag used to validate saved parameter blocks. */
 #define APP_PARAM_FLASH_MAGIC 0x53434152u
 /* Increment when default parameter layout/meaning changes. */
-#define APP_PARAM_FLASH_VERSION 3u
+#define APP_PARAM_FLASH_VERSION 4u
 
 #endif

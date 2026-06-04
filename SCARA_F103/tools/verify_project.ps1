@@ -106,13 +106,15 @@ $linker = Join-Path $projectRoot "STM32F103XX_FLASH.ld"
 $config = Join-Path $projectRoot "UserApp\app_config.h"
 Require-Text $linker "FLASH \(rx\)\s+:\s+ORIGIN = 0x8000000, LENGTH = 63K" "linker reserves final parameter page"
 Require-Text $config "APP_PARAM_FLASH_ADDR 0x0800F800u" "parameter page address is 0x0800F800"
-Require-Text $config "APP_FW_VERSION `"0\.24\.0`"" "firmware version is 0.24.0"
-Require-Text $config "APP_MOTOR1_ZERO_MRAD 233L" "motor 1 zero offset matches UI home"
-Require-Text $config "APP_MOTOR2_ZERO_MRAD 2908L" "motor 2 zero offset matches UI home"
+Require-Text $config "APP_FW_VERSION `"0\.24\.1`"" "firmware version is 0.24.1"
+Require-Text $config "APP_MOTOR1_ZERO_MRAD 2251L" "motor 1 zero offset matches symmetric UI home"
+Require-Text $config "APP_MOTOR2_ZERO_MRAD 890L" "motor 2 zero offset matches symmetric UI home"
 Require-Text $config "APP_SERIAL_BAUDRATE 115200u" "serial baudrate is 115200"
 Require-Text $config "APP_COMM_WATCHDOG_DEFAULT_MS 0u" "comm watchdog is disabled by default"
 Require-Text $config "APP_HOST_OWNS_LIMIT_CHECKS 1u" "host owns trajectory limit checks"
-Require-Text $config "APP_PARAM_FLASH_VERSION 3u" "parameter flash version invalidates old zero offsets"
+Require-Text $config "APP_SCARA_IK_LEFT_ELBOW_SIGN 1" "left IK branch is non-crossed"
+Require-Text $config "APP_SCARA_IK_RIGHT_ELBOW_SIGN \(-1\)" "right IK branch is non-crossed"
+Require-Text $config "APP_PARAM_FLASH_VERSION 4u" "parameter flash version invalidates old zero offsets"
 
 Write-Host "== Build Rules and VS Code =="
 $cmake = Join-Path $projectRoot "CMakeLists.txt"
@@ -134,6 +136,9 @@ Require-File (Join-Path $projectRoot "tools\home_sensor_check.ps1")
 Require-File (Join-Path $projectRoot "tools\gcode_stream_check.ps1")
 Require-File (Join-Path $projectRoot "tools\host_planned_stream_stress.ps1")
 Require-File (Join-Path $projectRoot "tools\ui_control_matrix_check.ps1")
+Require-File (Join-Path $projectRoot "tools\ui_trajectory_stress.ps1")
+Require-DocFile "..\SCARA_UI\V_monitor.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\V_monitor.py"
+Require-DocFile "..\SCARA_UI\tests\trajectory_planner_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\trajectory_planner_check.py"
 
 Write-Host "== Documentation =="
 Require-DocFile "..\Version.md" "C:\Users\22602\Desktop\SCARA\Version.md"

@@ -57,6 +57,11 @@ class FiveBarSerialGUI(
         self.cur_x, self.cur_y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
         self.HOME_X, self.HOME_Y = self.cur_x, self.cur_y
         self.history_x, self.history_y = [self.cur_x], [self.cur_y]
+        self.feedback_x, self.feedback_y = [], []
+        self.preview_x, self.preview_y = [], []
+        self.preview_label = ""
+        self._plot_user_view = False
+        self.velocity_monitor = None
         self.is_silent_move = False
         self.is_recording = False
         self.teach_data = []

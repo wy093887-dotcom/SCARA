@@ -24,7 +24,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_project.ps1
 当前验证重点：
 
 ```text
-固件版本：0.23.2
+固件版本：0.24.1
 串口波特率：115200 8N1
 通信看门狗：默认关闭
 正式轨迹限位：上位机负责
@@ -87,6 +87,32 @@ ENABLE 1
 ```
 
 这样可以避免刚烧录或刚急停后电机未使能，导致下位机在启动运动块时返回 `error:15`。`OK ENABLE 1`、`OK CLEAR_ERROR`、`OK ZERO` 只表示系统命令执行完成，不属于点动 G-code 的 `ok seq/cs/line` 回显，上位机不会用这些系统 OK 推进点动队列。
+
+### 坐标系与软件零点
+
+当前项目有两个 X 坐标表达：
+
+```text
+UI 坐标：左电机为 X=0，右电机为 X=150，UI 零点为 X=75, Y=220。
+MCU 坐标：双电机中点为 X=0，左电机约 X=-75，右电机约 X=75。
+```
+
+`SCARA_UI` 会自动转换：
+
+```text
+发送：X_mcu = X_ui - 75
+接收：X_ui  = X_mcu + 75
+```
+
+直接用串口工具手动发 G-code 时必须使用 MCU 坐标。例如 UI 中心零点附近应发送 `X0 Y220`，不是 `X75 Y220`。烧录 v0.24.1 后默认软件零点对应固件偏置：
+
+```text
+APP_MOTOR1_ZERO_MRAD = 2251
+APP_MOTOR2_ZERO_MRAD = 890
+APP_PARAM_FLASH_VERSION = 4
+```
+
+状态帧的 `M:x,y` 会有少量脉冲量化误差。v0.24.1 起，`P:0,0` 在新对称非交叉构型下通常回报约 `M:0.053,219.966`，换算到 UI 约为 `X=75.053,Y=219.966`。注意：步进电机是开环系统，烧录或 `ZERO` 只改变软件坐标解释，不会自动把实体杆件移动到新对称零点；真实点动前必须确认机械姿态已经与 UI `X=75,Y=220` 对应。
 
 ## 5. G-code 通信协议
 
@@ -301,11 +327,40 @@ cd C:\Users\22602\Desktop\SCARA\SCARA_F103
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\host_planned_stream_stress.ps1 -Port COM13 -Count 3000 -FeedMin 500 -FeedMax 1800 -EnableMotion
 ```
 
-逐条显示 TX/RX/MATCH。只看进度可加：
+UI 控键矩阵检查：
+```powershell
+cd C:\Users\22602\Desktop\SCARA\SCARA_F103
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_control_matrix_check.ps1 -Port AUTO
+```
+
+UI 轨迹规划压力检查：
+```powershell
+cd C:\Users\22602\Desktop\SCARA\SCARA_F103
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_trajectory_stress.ps1 -Port AUTO -Count 3000 -FeedMmMin 900
+```
+
+该脚本按上位机轨迹按钮逻辑生成：
+```text
+G1 直线：当前点 -> 目标点
+G2 顺圆：当前点 -> 目标点，按半径选择顺时针圆弧
+G3 逆圆：当前点 -> 目标点，按半径选择逆时针圆弧
+小车轨迹1：按 SOURCE\小车轨迹1.png 尺寸生成固定轮廓
+小车轨迹2：按 SOURCE\小车轨迹2.png 尺寸生成固定轮廓
+```
+
+发送前会遍历整条路径。若超限，会显示具体点、具体轴或结构和超出量，例如 M1/M2 角度超限、左右基座距离超限、主动臂交叉或主动臂低于基座线。
+
+脚本会显示每段 `PATH SAFE`、每 100 点进度、drain 状态和最终 `PATH PASS`。正式 ACK 仍逐条校验 `seq/cs/line`，但不会逐条刷屏。
+
+上位机离线规划检查：
 
 ```powershell
--QuietLines
+cd C:\Users\22602\Desktop\SCARA
+$env:PYTHONDONTWRITEBYTECODE='1'
+C:\Users\22602\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe SCARA_UI\tests\trajectory_planner_check.py
 ```
+
+该检查使用真实上位机规划器输出的点和 `F mm/min`，验证 G1/G2/G3 的相邻速度、圆弧中段速度、小车 1/2 图纸尺寸和五连杆限位。
 
 ## 12. PyQt 上位机仿真 UI
 
@@ -335,6 +390,7 @@ UI 功能：
 生成直线 + 圆弧 3000 点轨迹。
 上位机侧做五连杆正逆解和速度规划。
 实时显示 TX/RX。
-绘制末端轨迹、速度曲线、脉冲曲线、五连杆姿态和状态字段。
+主 UI 绘制末端轨迹、五连杆姿态和状态字段。
+速度/加速度曲线由 `SCARA_UI\V_monitor.py` 监控窗口显示，运行 `SCARA_UI\main.py` 时会自动启动。
 支持手动发送串口命令。
 ```

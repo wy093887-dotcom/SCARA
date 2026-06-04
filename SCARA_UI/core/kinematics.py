@@ -66,7 +66,7 @@ class FiveBarKinematics:
             ):
                 return None, None
 
-            q1 = math.atan2(y, x) - math.acos(
+            q1 = math.atan2(y, x) + math.acos(
                 self._clamp(
                     (c.active_link**2 + d1**2 - c.passive_link**2)
                     / (2.0 * c.active_link * d1),
@@ -74,7 +74,7 @@ class FiveBarKinematics:
                     1.0,
                 )
             )
-            q2 = math.atan2(y, x - c.base_distance) + math.acos(
+            q2 = math.atan2(y, x - c.base_distance) - math.acos(
                 self._clamp(
                     (c.active_link**2 + d2**2 - c.passive_link**2)
                     / (2.0 * c.active_link * d2),

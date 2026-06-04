@@ -1,5 +1,200 @@
 # SCARA_F103 Version Log
 
+## 2026-06-04 v0.24.3 上位机监控显示拆分
+
+### 完成
+
+- 删除主 UI 控键区右侧图中的速度图像，主 UI 只保留轨迹预览、已发送轨迹、下位机反馈轨迹和五连杆机构仿真。
+- `SCARA_UI/main.py` 启动主 UI 后，同步启动 `SCARA_UI/V_monitor.py` 中的电机速度/加速度监控窗口。
+- 速度/加速度监控数据只由下位机状态帧 `M:x,y` 换算得到：
+  - 主 UI 收到状态帧后先做 MCU 坐标到 UI 坐标转换。
+  - 再将真实反馈坐标以 `X... Y...` 形式送入 `MonitorWindow.process_new_data()`。
+  - ACK 回显仍只用于通信校验，不作为速度/加速度监控数据源。
+- `V_monitor.py` 保留 pyqtgraph 路径；若当前 Python 环境没有 `pyqtgraph`，自动退回 Matplotlib 绘图，避免主 UI 因缺依赖无法启动。
+
+### 验证
+
+- Python 内存编译通过：
+  - `V_monitor.py`、`app_bootstrap.py`、`plotting.py`、`ui_mixin.py`、`main_window.py`、`serial_mixin.py`。
+- 检索确认主 UI 已无 `speed_ax`、`speed_line`、`preview_f` 残留。
+- `SCARA_UI/tests/trajectory_planner_check.py` 通过，确认轨迹规划改动未被监控显示拆分影响。
+- `tools/verify_project.ps1` 通过，并检查 `SCARA_UI/V_monitor.py` 和 `SCARA_UI/tests/trajectory_planner_check.py` 均存在。
+
+## 2026-06-04 v0.24.2 上位机轨迹规划更新
+
+### 完成
+
+- 固件协议保持 `0.24.1` 不变，下位机仍只接收 `G1 X Y F ;ID=... LIM=1`。
+- 重做上位机速度规划：
+  - 规划器改为真实几何段 + 累计弧长 + 梯形/三角速度曲线。
+  - `G2/G3` 圆弧作为真实圆弧段规划，不再把圆弧离散点当作大量短折线拐角。
+  - `运行速度` 明确为 `mm/s`，发送前换算为 G-code 的 `F mm/min`。
+- 改造 UI 轨迹显示：
+  - 点击直线、顺圆、逆圆、小车 1、小车 2 时，先显示同一份真实规划结果作为预览，再装载发送队列。
+  - 绘图分层显示规划预览、已发送点、下位机状态帧反馈点和当前五连杆姿态。
+  - 速度曲线显示规划器输出的真实 `F mm/min`，不做平滑美化。
+  - 轨迹图支持鼠标滚轮缩放和左键拖动；运动刷新不再强制重置用户视野。
+- 修正固定小车轨迹：
+  - 小车轨迹 1 按 `SOURCE\小车轨迹1.png` 尺寸生成，左下基准点来自 UI 输入，宽 `120mm`、车身高 `24mm`、轮心 `(36,0)/(96,0)`、轮拱 `R12`、车厢高到 `48mm`。
+  - 小车轨迹 2 按 `SOURCE\小车轨迹2.png` 尺寸生成，左下基准点来自 UI 输入，宽 `160mm`、车身高 `20mm`、轮心 `(32,0)/(128,0)`、轮拱 `R12`、车顶 `60mm` 宽。
+- 新增 `SCARA_UI/tests/trajectory_planner_check.py`，检查 G1/G2/G3 速度连续性、小车尺寸和五连杆限位。
+- `tools/ui_trajectory_stress.ps1` 扩展为五段压力测试：G1、G2、G3、小车轨迹 1、小车轨迹 2。
+
+### 验证
+
+- `SCARA_UI/tests/trajectory_planner_check.py` 通过：
+  - G1 输出 `106` 点，G2 输出 `116` 点，G3 输出 `116` 点。
+  - 小车轨迹 1 输出 `500` 点，小车轨迹 2 输出 `564` 点。
+  - 所有路径通过五连杆限位预检查。
+  - 相邻点速度满足规划加速度约束，圆弧中段不再出现周期性跌落。
+- Python 内存编译通过：
+  - `look_ahead.py`、`motion_mixin.py`、`plotting.py`、`ui_mixin.py`、`main_window.py`、`serial_mixin.py`、`trajectory_planner_check.py`。
+- PowerShell AST 解析通过：
+  - `tools/ui_trajectory_stress.ps1`。
+  - `tools/verify_project.ps1`。
+- `tools/verify_project.ps1` 通过，并检查新增 `SCARA_UI/tests/trajectory_planner_check.py` 存在。
+- `tools/gcode_stream_check.ps1 -Port COM13` 通过：
+  - `VERSION` 返回固件 `0.24.1`。
+  - `HOSTCAP` 返回 `host_plan=1 host_limit=1 mcu_soft_limit=0`。
+  - 状态为 `Idle/Q:0/E:0`。
+- 新版 `tools/ui_trajectory_stress.ps1 -Port COM13 -Count 3000 -FeedMmMin 900` 通过：
+  - G1、G2、G3、小车轨迹 1、小车轨迹 2 各 600 点。
+  - 五段均显示 `PATH SAFE`，并通过 ACK 精确回显。
+  - 最终 `UI_TRAJECTORY_STRESS PASS total=3000`。
+- 压力测试后再次执行 `tools/gcode_stream_check.ps1 -Port COM13` 通过：
+  - `HEARTBEAT err=0 motion=Idle gbuf=32,0`。
+  - 状态帧 `Idle/Q:0/E:0`，`A1/A2` 均已释放。
+  - 最终软件位置为 `M:0.049,201.151`、`P:14,-14`，这是小车闭合轮廓后的量化位置，不是通信错误。
+
+### 原因
+
+- 原规划器将圆弧采样点交给折线 junction 限速，导致圆弧内部反复降速，真实 `F` 序列出现锯齿。
+- 原 UI 每个轨迹点都 `ax.clear()` 并重绘工作空间、历史轨迹和姿态，使规划点发送频繁时视觉抖动明显。
+- 原小车轨迹只是从当前点到起始点再走一条直线，和 `SOURCE` 图纸尺寸不一致。
+
+## 2026-06-04 v0.24.1
+
+### 完成
+
+- 修正五连杆构型分支：实际机构不是交叉五连杆，而是左右对称的并联五连杆。
+  - 上位机逆解从左臂 `-`、右臂 `+` 改为左臂 `+`、右臂 `-`。
+  - 固件默认 `APP_SCARA_IK_LEFT_ELBOW_SIGN` 改为 `1`，`APP_SCARA_IK_RIGHT_ELBOW_SIGN` 改为 `-1`。
+  - UI 绘图将随新的逆解分支显示为两侧主动臂向外上方展开、被动臂在上方末端汇合的非交叉构型。
+- 重新计算默认软件零点 `UI X=75, Y=220`：
+  - 左关节约 `128.984 deg`，右关节约 `51.016 deg`。
+  - 固件零点偏置更新为 `APP_MOTOR1_ZERO_MRAD=2251`、`APP_MOTOR2_ZERO_MRAD=890`。
+  - `APP_PARAM_FLASH_VERSION` 提升到 `4`，使旧交叉构型零点参数失效。
+- 同步更新 `tools/verify_project.ps1` 和 `tools/ui_control_matrix_check.ps1` 的分支与零点检查。
+- 修复上位机轨迹规划按钮只显示“参数错误”的问题：
+  - `plan_trajectory()` 不再裸 `except`，会区分输入数字错误、半径错误、路径预检查失败和规划异常。
+  - `G1 直线` 会从当前点到目标点生成直线点流。
+  - 新增 `G3 逆圆`；`G2 顺圆` 和 `G3 逆圆` 都由上位机按半径离散成连续 `G1` 点流，下位机仍只执行 `G1`。
+  - 轨迹发送前遍历整条路径，检查 XY 工作空间、左右基座距离、M1/M2 角度、主动臂是否交叉、主动臂是否低于基座线；超限时显示具体轴/结构、限值和超出量。
+- 新增 `tools/ui_trajectory_stress.ps1`：
+  - 按 UI 轨迹按钮逻辑生成一段直线、一段 G2 顺圆、一段 G3 逆圆。
+  - 发送前执行同一套非交叉五连杆路径预检查。
+  - 再转换为 MCU 中点坐标逐条发送 `G1`，校验 `ok seq/cs/line`。
+
+### 验证
+
+- 离线运动学抽检通过：
+  - `UI X=75,Y=220`、四方向点动点、默认轨迹点和小车路径端点均可逆解。
+  - 正解回代误差为 `0`。
+  - 左肘点 X 坐标始终小于右肘点 X 坐标，确认绘图为非交叉构型。
+- `tools/verify_project.ps1` 通过：
+  - 固件版本为 `0.24.1`。
+  - 固件零点偏置为 `2251/890`。
+  - 固件分支为左 `+`、右 `-`。
+  - 参数页版本为 `4`。
+- 已重新烧录当前 `build/Debug/SCARA_F103.elf`，OpenOCD verify 输出 `** Verified OK **`。
+- 烧录后 `tools/gcode_stream_check.ps1 -Port COM13` 通过：
+  - `VERSION` 返回 `0.24.1`。
+  - `HEARTBEAT` 返回 `err=0 motion=Idle gbuf=32,0`。
+  - 状态帧为 `Idle/Q:0/E:0`，`P:0,0` 对应 MCU `M:0.053,219.966`，符合新零点量化误差。
+- 上位机模拟点击验证通过：
+  - `G1 直线`、`G2 顺圆`、`G3 逆圆` 均能从当前点到目标点生成可发送轨迹。
+  - 半径过小会被拦截。
+  - 超出工作区/关节/结构限制的目标会被拦截并输出错误日志。
+- `tools/ui_trajectory_stress.ps1 -Port COM13 -Count 300 -FeedMmMin 600` 通过：
+  - G1/G2/G3 各 100 点。
+  - 三段均显示 `PATH SAFE`。
+  - 终态 `Idle/Q:0/E:0`。
+- `tools/ui_trajectory_stress.ps1 -Port COM13 -Count 3000 -FeedMmMin 900` 通过：
+  - G1 直线 1000 点、G2 顺圆 1000 点、G3 逆圆 1000 点。
+  - 三段均通过路径预检查和 ACK 精确回显。
+  - 最终 `UI_TRAJECTORY_STRESS PASS total=3000`，终态 `Idle/Q:0/E:0`。
+- 压力测试后 `tools/gcode_stream_check.ps1 -Port COM13` 通过：
+  - `HEARTBEAT err=0 motion=Idle gbuf=32,0`。
+  - 状态帧 `Idle/Q:0/E:0`，电机已释放。
+- 烧录后再次执行 `tools/ui_control_matrix_check.ps1 -Port COM13` 通过：
+  - 覆盖四方向点动、M1/M2 单轴点动、默认轨迹、小车路径、急停、清错和释放电机。
+  - 结束后 `tools/gcode_stream_check.ps1 -Port COM13` 通过，状态为 `Idle/Q:0/E:0`，`A1/A2` 均已释放。
+  - 因最后一段为小车路径，最终软件位置停在 `M:159.366,200.286`、`P:-237,-203`，不是零点；这是测试路径终点，不是通信错误。
+
+### 原因
+
+- v0.24.0 虽然统一了上下位机分支，但统一到的是交叉构型；用户提供的机构图和真实机械结构是对称并联构型。
+- 如果继续使用交叉分支，UI 动画会显示左右连杆交叉，固件 `ZERO` 后的脉冲零点也会对应错误姿态。
+- 注意：步进电机是开环系统，烧录或 `ZERO` 只改变软件坐标解释，不会自动把实体杆件移动到新对称零点；真实点动前需要先确认机械姿态与 `UI X=75,Y=220` 的对称零点一致。
+
+## 2026-06-04 v0.24.0
+
+### 完成
+
+- 按本仓库 `SOURCE` 五连杆资料、MathWorks five-bar robot 参考页和本地 GRBL 1.1h 工程重新审查上下位机分工：
+  - 轨迹仍由上位机规划和限位，MCU 只做 G-code 接收、几何可达性兜底、队列执行和状态回传。
+  - 正逆解统一为五连杆左臂 `-`、右臂 `+` 分支，并在正解时选择 Y 更高的圆交点，避免 UI 与固件使用不同构型分支。
+  - 参考资料中的连杆公式只取运动学形式，不直接套用资料中的样机尺寸；当前项目继续使用 `base=150 mm`、`active=160 mm`、`passive=200 mm`。
+- 修复上下位机 X 坐标原点不一致：
+  - `SCARA_UI` 显示/操作仍使用左电机为原点的 UI 坐标，工作区中心在 `X=75 mm`。
+  - 固件 G-code 和状态帧使用双电机中点为原点的 MCU 坐标。
+  - 上位机发送 G-code 时自动执行 `X_mcu = X_ui - 75`，读取 `M:x,y` 或 ACK 回显时自动执行 `X_ui = X_mcu + 75`。
+- 统一软件零点：
+  - UI 安全零点改为 `X=75.0, Y=220.0`，保证上下左右 10 mm 点动都可达。
+  - 固件零点偏置更新为 `APP_MOTOR1_ZERO_MRAD=233`、`APP_MOTOR2_ZERO_MRAD=2908`。
+  - `APP_PARAM_FLASH_VERSION` 提升到 `3`，强制旧 Flash 参数失效，避免继续使用旧零点。
+- 新增 `SCARA_F103/tools/ui_control_matrix_check.ps1`：
+  - 1:1 复刻 UI 控键串口行为，覆盖 VERSION/HOSTCAP、清错、使能、软零、四方向点动、M1/M2 点动、默认轨迹、小车路径、急停和释放电机。
+  - 对 `error:8` 诊断为发送太快或 pending/buffer 忙，对 `error:15` 诊断为运动拒绝、逆解失败、电机未使能、急停或错误位未清。
+- 固件版本号更新为 `0.24.0`，并同步更新自检脚本、坐标零点检查和文档。
+
+### 验证
+
+- `tools/verify_project.ps1` 通过：
+  - Debug 构建通过。
+  - 固件大小 `51052 <= 64512 bytes`。
+  - 固件版本、零点偏置、参数页版本和控键矩阵脚本检查通过。
+- `SCARA_UI` 关键 Python 文件 `py_compile` 通过。
+- 已烧录 `0.24.0` 到 STM32F103，OpenOCD verify 通过。
+- 烧录后基础串口检查已通过一次：`VERSION` 返回 `0.24.0`，`HOSTCAP` 正常，状态帧 `E:0`，零点状态约为 MCU `M:0.115,220.000`，对应 UI `X=75.115, Y=220.000`。
+- `tools/ui_control_matrix_check.ps1 -Port COM13` 真实硬件通过：
+  - 覆盖 `VERSION`、`HOSTCAP`、`WATCHDOG OFF`、`CLEAR_ERROR`、`ENABLE 1`、`ZERO`。
+  - 覆盖前进、后退、左移、右移、M1+/M1-、M2+/M2-、默认轨迹、小车轨迹起点/终点。
+  - 每个运动指令均收到 `ok seq/cs/line` 精确回显，运动后回到 `Idle/Q:0/E:0`，未出现 `error:8` 或 `error:15`。
+  - 最后 `ESTOP`、`CLEAR_ERROR`、`ENABLE 0` 通过。
+- `tools/host_planned_stream_stress.ps1 -Port COM13 -Count 3000 -FeedMin 500 -FeedMax 1800 -EnableMotion -QuietLines` 通过：
+  - `ok=3000`。
+  - 总耗时约 `36.3 s`。
+  - 终态 `<Idle|...|Bf:32,16|Q:0|E:0|...>`。
+- 故意 5 行 burst 不等待 ACK 的小测试全部被下位机缓冲并正常 ACK；结合固件源码，`error:8` 只会在 32 段规划队列已满且已有 1 条 pending 未释放时触发。
+- 压力测试后 `tools/gcode_stream_check.ps1 -Port COM13` 通过：`HEARTBEAT err=0 motion=Idle gbuf=32,0`，状态帧 `Idle/Q:0/E:0`，电机已释放。
+- 最终再次执行 OpenOCD `program build/Debug/SCARA_F103.elf verify reset exit`，烧录和校验均通过，输出 `** Verified OK **`。
+- 最终烧录后 `tools/gcode_stream_check.ps1 -Port COM13` 通过：
+  - `VERSION` 返回 `0.24.0`。
+  - 初始状态回到 MCU `M:0.115,220.000`、`P:0,0`、`Idle/Q:0/E:0`。
+  - `HEARTBEAT` 返回 `err=0 motion=Idle gbuf=32,0`。
+
+### 根因
+
+- “点动只运行一下随后报错”不是单一问题：
+  - v0.23.2 已修复系统 `OK ...` 被旧上位机误当作 G-code `ok seq/cs/line` 的 ACK，导致队列推进错乱。
+  - v0.24.0 继续修复 UI/MCU 坐标原点和正逆解分支不一致，避免目标点在 UI 看起来可达、但下位机按另一套坐标或构型判断后返回运动拒绝。
+- 当前实测结论：
+  - 不是点数太多：3000 点密集流通过。
+  - 不是正常 UI 节奏太快：逐条等待 ACK 时没有 `error:8`。
+  - 不是五连杆正逆解分支错误：控键矩阵和轨迹点均被 MCU 接受并执行。
+  - 真正风险是上位机若不区分系统 `OK` 和 G-code ACK，或直接用 UI 坐标当 MCU 坐标发给串口，就会造成队列错乱或 `error:15`。
+
 ## 2026-06-04 v0.23.2
 
 ### 完成

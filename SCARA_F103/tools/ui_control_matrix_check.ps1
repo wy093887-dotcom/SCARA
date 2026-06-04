@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Port = "COM12",
+    [string]$Port = "AUTO",
     [int]$Baud = 115200,
     [int]$TimeoutMs = 2000,
     [int]$DrainTimeoutMs = 30000,
@@ -19,6 +19,23 @@ $HomeX = 75.0
 $HomeY = 220.0
 $JogMm = 10.0
 $MotorJogDeg = 3.0
+
+function Resolve-SerialPortName {
+    param([string]$Requested)
+    if ($Requested -and $Requested.ToUpperInvariant() -ne "AUTO") {
+        return $Requested
+    }
+
+    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    if ($ports.Count -eq 1) {
+        Write-Host ("AUTO port selected: {0}" -f $ports[0])
+        return $ports[0]
+    }
+    if ($ports.Count -eq 0) {
+        throw "未发现串口，请检查 USB 转串口/单片机连接，或使用 -Port COMx 指定端口。"
+    }
+    throw ("发现多个串口：{0}；请使用 -Port COMx 明确指定。" -f ($ports -join ", "))
+}
 
 function Get-Checksum {
     param([string]$Line)
@@ -61,8 +78,8 @@ function Get-InverseDeg {
     $c2 = (($ActiveMm * $ActiveMm) + ($d2 * $d2) - ($PassiveMm * $PassiveMm)) / (2.0 * $ActiveMm * $d2)
     $c1 = [Math]::Max(-1.0, [Math]::Min(1.0, $c1))
     $c2 = [Math]::Max(-1.0, [Math]::Min(1.0, $c2))
-    $q1 = [Math]::Atan2($Y, $X) - [Math]::Acos($c1)
-    $q2 = [Math]::Atan2($Y, $X - $BaseMm) + [Math]::Acos($c2)
+    $q1 = [Math]::Atan2($Y, $X) + [Math]::Acos($c1)
+    $q2 = [Math]::Atan2($Y, $X - $BaseMm) - [Math]::Acos($c2)
     return [pscustomobject]@{
         Q1 = $q1 * 180.0 / [Math]::PI
         Q2 = $q2 * 180.0 / [Math]::PI
@@ -86,12 +103,14 @@ function Get-ForwardXY {
     $h = [Math]::Sqrt([Math]::Max(0.0, ($PassiveMm * $PassiveMm) - (($d * 0.5) * ($d * 0.5))))
     $rx = -$dy / $d
     $ry = $dx / $d
-    $p1 = @($mx + $h * $rx, $my + $h * $ry)
-    $p2 = @($mx - $h * $rx, $my - $h * $ry)
-    if ($p1[1] -ge $p2[1]) {
-        return [pscustomobject]@{ X = $p1[0]; Y = $p1[1] }
+    [double]$x1 = $mx + ($h * $rx)
+    [double]$y1 = $my + ($h * $ry)
+    [double]$x2 = $mx - ($h * $rx)
+    [double]$y2 = $my - ($h * $ry)
+    if ($y1 -ge $y2) {
+        return [pscustomobject]@{ X = $x1; Y = $y1 }
     }
-    return [pscustomobject]@{ X = $p2[0]; Y = $p2[1] }
+    return [pscustomobject]@{ X = $x2; Y = $y2 }
 }
 
 function New-G1Line {
@@ -184,6 +203,7 @@ function Send-UiMove {
     Wait-Idle -Serial $Serial -Name $Name
 }
 
+$Port = Resolve-SerialPortName -Requested $Port
 $serial = [System.IO.Ports.SerialPort]::new($Port, $Baud, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One)
 $serial.NewLine = "`n"
 $serial.ReadTimeout = $TimeoutMs

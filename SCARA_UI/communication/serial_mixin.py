@@ -123,21 +123,7 @@ class ScaraSerialMixin:
                     self.log_display.append(f"<font color='#ffffff'>RX {ts} [ACK {self.sent_point_id}/{self.total_task_points}] {raw}</font>")
                     self.log_display.append(f"<font color='#00ff99'>MATCH cs={ack.expected_checksum} line=OK</font>")
                     
-                    # "通讯接收内容"模式：从ACK回传的line中提取坐标更新绘图
-                    if self.plot_mode_combo.currentText() == "通讯接收内容":
-                        # 从 ack.rx_line 中提取 X 和 Y 坐标
-                        if ack.rx_line:
-                            x_match = re.search(r'X([-?\d.]+)', ack.rx_line)
-                            y_match = re.search(r'Y([-?\d.]+)', ack.rx_line)
-                            if x_match and y_match:
-                                rx, ry = self.mcu_to_ui_xy(float(x_match.group(1)), float(y_match.group(1)))
-                                self.cur_x, self.cur_y = rx, ry
-                                self.history_x.append(rx)
-                                self.history_y.append(ry)
-                                ik = self.inverse_kinematics(rx, ry)
-                                if ik and ik[0] is not None:
-                                    self.update_plot(ik[0], ik[1])
-                            
+                    # ACK line 是下位机回显的目标命令，不是真实运动反馈；真实反馈只使用状态帧 M:x,y。
                     # 只有匹配当前 G-code 的 ACK 才能推进队列，避免 OK ENABLE/OK ZERO 误触发点动发送。
                     self.process_queue()
                     return
@@ -165,15 +151,20 @@ class ScaraSerialMixin:
                     if hs_match and hs_match.group(1).lower() == "done": 
                         self.is_homed = True
                     
-                    if self.plot_mode_combo.currentText() == "通讯接收内容":
-                        match = re.search(r'M:([-?\d.]+),([-?\d.]+)', raw)
-                        if match:
-                            rx, ry = self.mcu_to_ui_xy(float(match.group(1)), float(match.group(2)))
+                    match = re.search(r'M:([-?\d.]+),([-?\d.]+)', raw)
+                    if match:
+                        rx, ry = self.mcu_to_ui_xy(float(match.group(1)), float(match.group(2)))
+                        if hasattr(self, "append_feedback_point"):
+                            self.append_feedback_point(rx, ry)
+                        if getattr(self, "velocity_monitor", None) is not None:
+                            self.velocity_monitor.process_new_data(f"X{rx:.3f} Y{ry:.3f}")
+                        if self.plot_mode_combo.currentText() == "通讯接收内容":
                             self.cur_x, self.cur_y = rx, ry
-                            self.history_x.append(rx)
-                            self.history_y.append(ry)
                             ik = self.inverse_kinematics(rx, ry)
-                            if ik and ik[0] is not None: self.update_plot(ik[0], ik[1])
+                            if ik and ik[0] is not None:
+                                self.update_plot(ik[0], ik[1])
+                        else:
+                            self.update_plot()
                     return
 
                 # 4. 处理错误报警
