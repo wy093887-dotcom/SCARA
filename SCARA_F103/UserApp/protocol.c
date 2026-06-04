@@ -1,0 +1,209 @@
+#include "protocol.h"
+
+/* 调试/安全文本协议：处理 VERSION、STATUS、HOSTCAP、ENABLE、STOP 等非 G-code 命令。 */
+
+#include "app_config.h"
+#include "gcode_stream.h"
+#include "home_controller.h"
+#include "home_sensor.h"
+#include "motion_planner.h"
+#include "serial_dma.h"
+#include "stepper_driver.h"
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static bool s_watchdog_enabled;
+static uint32_t s_watchdog_timeout_ms;
+static uint32_t s_watchdog_last_rx_ms;
+static uint32_t s_protocol_tick_ms;
+static bool s_watchdog_tripped;
+
+static void upper_token(char *text)
+{
+    while (*text != '\0') {
+        *text = (char)toupper((unsigned char)*text);
+        text++;
+    }
+}
+
+void Protocol_Init(void)
+{
+    s_watchdog_enabled = APP_COMM_WATCHDOG_DEFAULT_MS > 0u;
+    s_watchdog_timeout_ms = APP_COMM_WATCHDOG_DEFAULT_MS;
+    s_watchdog_last_rx_ms = 0;
+    s_protocol_tick_ms = 0;
+    s_watchdog_tripped = false;
+}
+
+void Protocol_Loop(void)
+{
+}
+
+void Protocol_SendStatus(void)
+{
+    /* STATUS 是人工调试用长状态；自动 UI 状态主要由 gcode_stream.c 的 <...> 推送提供。 */
+    StepperState s;
+    HomeSensorState home;
+    Stepper_GetStateSnapshot(&s);
+    HomeSensor_GetState(&home);
+
+    SerialDma_SendFormat("STAT t=%lu m=%s e=%lu p=%ld,%ld "
+                         "r=%u,%u en=%u,%u pps=%ld,%ld tgt=%ld,%ld wd=%u idle=%lu "
+                         "rxov=%lu txd=%lu txq=%lu h=%u,%u hs=%s he=%u "
+                         "bf=%u,%u\r\n",
+                         (unsigned long)s.tick_ms,
+                         Stepper_ModeName(s.axis[0].mode != STEPPER_MODE_IDLE ? s.axis[0].mode : s.axis[1].mode),
+                         (unsigned long)(s.axis[0].error | s.axis[1].error),
+                         (long)s.axis[0].position_pulse,
+                         (long)s.axis[1].position_pulse,
+                         s.axis[0].running ? 1u : 0u,
+                         s.axis[1].running ? 1u : 0u,
+                         s.axis[0].enabled ? 1u : 0u,
+                         s.axis[1].enabled ? 1u : 0u,
+                         (long)s.axis[0].current_pps,
+                         (long)s.axis[1].current_pps,
+                         (long)s.axis[0].target_pps,
+                         (long)s.axis[1].target_pps,
+                         s_watchdog_enabled ? 1u : 0u,
+                         (unsigned long)(s_protocol_tick_ms - s_watchdog_last_rx_ms),
+                         (unsigned long)SerialDma_RxOverflowCount(),
+                         (unsigned long)SerialDma_TxDropCount(),
+                         (unsigned long)SerialDma_TxQueuedCount(),
+                         home.home1_active ? 1u : 0u,
+                         home.home2_active ? 1u : 0u,
+                         HomeController_StateName(HomeController_GetState()),
+                         (unsigned int)HomeController_Error(),
+                         (unsigned int)GcodeStream_PlannerFree(),
+                         (unsigned int)GcodeStream_PlannerCount());
+}
+
+static void send_errors(void)
+{
+    StepperState s;
+    Stepper_GetStateSnapshot(&s);
+    uint32_t err = s.axis[0].error | s.axis[1].error;
+
+    SerialDma_SendFormat("ERRORS err=%lu soft_limit=%u estop=%u comm_timeout=%u disabled=%u\r\n",
+                         (unsigned long)err,
+                         (err & STEPPER_ERR_SOFT_LIMIT) ? 1u : 0u,
+                         (err & STEPPER_ERR_ESTOP) ? 1u : 0u,
+                         (err & STEPPER_ERR_COMM_TIMEOUT) ? 1u : 0u,
+                         (err & STEPPER_ERR_DISABLED) ? 1u : 0u);
+}
+
+void Protocol_ProcessLine(const char *line)
+{
+    char cmd[APP_SERIAL_LINE_SIZE];
+    long a = 0;
+
+    if (line == NULL || line[0] == '\0') {
+        return;
+    }
+
+    /* 任意有效串口输入都会刷新看门狗时间；默认看门狗已关闭，课程调试更清爽。 */
+    s_watchdog_last_rx_ms = s_protocol_tick_ms;
+
+    if (GcodeStream_TryProcessLine(line)) {
+        return;
+    }
+
+    strncpy(cmd, line, sizeof(cmd) - 1u);
+    cmd[sizeof(cmd) - 1u] = '\0';
+    upper_token(cmd);
+
+    if (strcmp(cmd, "PING") == 0) {
+        SerialDma_Send("OK PONG\r\n");
+    } else if (strcmp(cmd, "VERSION") == 0) {
+        SerialDma_SendFormat("OK VERSION name=%s version=%s app_flash=63K baud=%lu\r\n",
+                             APP_FW_NAME,
+                             APP_FW_VERSION,
+                             (unsigned long)APP_SERIAL_BAUDRATE);
+    } else if (strcmp(cmd, "HOSTCAP") == 0) {
+        /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
+        SerialDma_Send("OK HOSTCAP role=pulse_executor host_plan=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F ack=seq_cs_line comments=echo_ignored\r\n");
+    } else if (strcmp(cmd, "STATUS") == 0 || strcmp(cmd, "QSTAT") == 0) {
+        Protocol_SendStatus();
+    } else if (sscanf(cmd, "HEARTBEAT %ld", &a) == 1) {
+        StepperState s;
+        Stepper_GetStateSnapshot(&s);
+        SerialDma_SendFormat("OK HEARTBEAT seq=%ld tick=%lu err=%lu motion=%s home=%s gbuf=%u,%u\r\n",
+                             a,
+                             (unsigned long)s.tick_ms,
+                             (unsigned long)(s.axis[0].error | s.axis[1].error),
+                             Stepper_IsBusy() ? "Run" : "Idle",
+                             HomeController_StateName(HomeController_GetState()),
+                             (unsigned int)GcodeStream_PlannerFree(),
+                             (unsigned int)GcodeStream_PlannerCount());
+    } else if (strcmp(cmd, "ERRORS") == 0) {
+        send_errors();
+    } else if (strcmp(cmd, "HOME_SENSOR") == 0) {
+        HomeSensorState home;
+        HomeSensor_GetState(&home);
+        SerialDma_SendFormat("OK HOME_SENSOR h1=%u h2=%u mask=%u active_level=%u pins=PB0,PB1\r\n",
+                             home.home1_active ? 1u : 0u,
+                             home.home2_active ? 1u : 0u,
+                             (unsigned int)home.active_mask,
+                             (unsigned int)APP_HOME_SWITCH_ACTIVE_LEVEL);
+    } else if (strcmp(cmd, "WATCHDOG") == 0) {
+        SerialDma_SendFormat("OK WATCHDOG enabled=%u timeout_ms=%lu idle_ms=%lu tripped=%u\r\n",
+                             s_watchdog_enabled ? 1u : 0u,
+                             (unsigned long)s_watchdog_timeout_ms,
+                             (unsigned long)(s_protocol_tick_ms - s_watchdog_last_rx_ms),
+                             s_watchdog_tripped ? 1u : 0u);
+    } else if (sscanf(cmd, "WATCHDOG ON %ld", &a) == 1) {
+        if (a > 0) {
+            s_watchdog_enabled = true;
+            s_watchdog_timeout_ms = (uint32_t)a;
+            s_watchdog_last_rx_ms = s_protocol_tick_ms;
+            s_watchdog_tripped = false;
+            SerialDma_Send("OK WATCHDOG ON\r\n");
+        } else {
+            SerialDma_Send("ERR WATCHDOG\r\n");
+        }
+    } else if (strcmp(cmd, "WATCHDOG OFF") == 0) {
+        s_watchdog_enabled = false;
+        s_watchdog_tripped = false;
+        SerialDma_Send("OK WATCHDOG OFF\r\n");
+    } else if (strcmp(cmd, "STOP") == 0) {
+        HomeController_Stop();
+        MotionPlanner_Stop();
+        SerialDma_Send("OK STOP\r\n");
+    } else if (strcmp(cmd, "ESTOP") == 0) {
+        HomeController_Stop();
+        Stepper_EStopAll();
+        SerialDma_Send("OK ESTOP\r\n");
+    } else if (strcmp(cmd, "CLEAR_ERROR") == 0 || strcmp(cmd, "RESET") == 0) {
+        Stepper_ClearError();
+        HomeController_ClearError();
+        s_watchdog_tripped = false;
+        SerialDma_Send("OK CLEAR_ERROR\r\n");
+    } else if (strcmp(cmd, "ZERO") == 0) {
+        MotionPlanner_Stop();
+        Stepper_Zero();
+        SerialDma_Send("OK ZERO\r\n");
+    } else if (sscanf(cmd, "ENABLE %ld", &a) == 1) {
+        Stepper_EnableAll(a != 0);
+        SerialDma_Send(a != 0 ? "OK ENABLE 1\r\n" : "OK ENABLE 0\r\n");
+    } else {
+        SerialDma_Send("ERR BAD_CMD\r\n");
+    }
+}
+
+void Protocol_Tick1kHz(void)
+{
+    s_protocol_tick_ms++;
+
+    if (s_watchdog_enabled &&
+        s_watchdog_timeout_ms > 0u &&
+        !s_watchdog_tripped &&
+        (s_protocol_tick_ms - s_watchdog_last_rx_ms) > s_watchdog_timeout_ms &&
+        Stepper_IsBusy()) {
+        MotionPlanner_Stop();
+        Stepper_SetErrorAll(STEPPER_ERR_COMM_TIMEOUT);
+        s_watchdog_tripped = true;
+    }
+}

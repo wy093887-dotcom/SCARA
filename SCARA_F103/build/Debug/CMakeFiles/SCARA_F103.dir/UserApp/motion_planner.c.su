@@ -1,0 +1,6 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:7:6:MotionPlanner_SetAccel	16	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:13:6:MotionPlanner_Speed	16	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:19:6:MotionPlanner_MoveRel	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:24:6:MotionPlanner_MoveAbs	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:29:6:MotionPlanner_MoveAbsBlend	40	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/motion_planner.c:34:6:MotionPlanner_Stop	8	static

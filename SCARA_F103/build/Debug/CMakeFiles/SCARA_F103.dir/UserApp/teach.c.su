@@ -1,0 +1,8 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:21:17:teach_crc	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:36:6:Teach_Init	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:42:6:Teach_Clear	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:47:6:Teach_AddCurrent	128	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:61:6:Teach_Save	584	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:98:6:Teach_Load	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:114:8:Teach_Count	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/teach.c:119:6:Teach_Get	16	static

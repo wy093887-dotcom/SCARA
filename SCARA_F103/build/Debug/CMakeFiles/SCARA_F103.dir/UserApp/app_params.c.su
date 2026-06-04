@@ -1,0 +1,8 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:20:17:params_crc	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:32:9:AppParams_NormalizeSign	16	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:37:6:AppParams_Defaults	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:63:6:AppParams_Init	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:69:18:AppParams_Get	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:74:12:AppParams_Mutable	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:79:6:AppParams_Load	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/app_params.c:98:6:AppParams_Save	160	static

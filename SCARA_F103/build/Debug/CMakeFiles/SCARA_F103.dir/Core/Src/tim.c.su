@@ -1,0 +1,6 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:32:6:MX_TIM1_Init	96	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:102:6:MX_TIM2_Init	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:142:6:MX_TIM4_Init	64	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:196:6:HAL_TIM_Base_MspInit	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:237:6:HAL_TIM_MspPostInit	40	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/Core/Src/tim.c:281:6:HAL_TIM_Base_MspDeInit	16	static

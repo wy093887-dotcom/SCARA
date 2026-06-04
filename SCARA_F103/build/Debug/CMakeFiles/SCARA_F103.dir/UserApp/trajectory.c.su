@@ -1,0 +1,12 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:13:6:Trajectory_Init	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:21:6:Trajectory_Tick1kHz	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:30:6:Trajectory_Loop	32	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:48:6:Trajectory_IsBusy	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:53:6:Trajectory_Clear	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:61:6:Trajectory_AddPulse	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:75:6:Trajectory_Run	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:87:6:Trajectory_Validate	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:101:6:Trajectory_Stop	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:108:8:Trajectory_Count	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:113:8:Trajectory_Index	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/trajectory.c:118:6:Trajectory_Get	24	static

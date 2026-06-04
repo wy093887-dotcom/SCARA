@@ -1,0 +1,30 @@
+#ifndef BOARD_PINS_H
+#define BOARD_PINS_H
+
+#include "main.h"
+#include "tim.h"
+#include "usart.h"
+
+#define BOARD_M1_TIM (&htim1)
+#define BOARD_M1_TIM_CHANNEL TIM_CHANNEL_1
+#define BOARD_M2_TIM (&htim4)
+#define BOARD_M2_TIM_CHANNEL TIM_CHANNEL_1
+#define BOARD_TICK_TIM (&htim2)
+#define BOARD_UART (&huart1)
+
+#define BOARD_M1_DIR_PORT M1_DIR_GPIO_Port
+#define BOARD_M1_DIR_PIN M1_DIR_Pin
+#define BOARD_M1_ENA_PORT M1_ENA_GPIO_Port
+#define BOARD_M1_ENA_PIN M1_ENA_Pin
+
+#define BOARD_M2_DIR_PORT M2_DIR_GPIO_Port
+#define BOARD_M2_DIR_PIN M2_DIR_Pin
+#define BOARD_M2_ENA_PORT M2_ENA_GPIO_Port
+#define BOARD_M2_ENA_PIN M2_ENA_Pin
+
+#define BOARD_HOME1_PORT HOME1_GPIO_Port
+#define BOARD_HOME1_PIN HOME1_Pin
+#define BOARD_HOME2_PORT HOME2_GPIO_Port
+#define BOARD_HOME2_PIN HOME2_Pin
+
+#endif

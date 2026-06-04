@@ -1,0 +1,15 @@
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:22:16:axis_search_pps	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:28:16:axis_backoff_delta	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:34:13:enter_state	16	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:42:13:sensor_active	24	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:49:13:debounce_axis	16	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:61:13:start_backoff	176	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:75:6:HomeController_Init	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:84:6:HomeController_Start	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:105:6:HomeController_Stop	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:114:6:HomeController_ClearError	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:122:6:HomeController_Loop	8	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:174:6:HomeController_Tick1kHz	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:184:21:HomeController_GetState	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:189:9:HomeController_Error	4	static
+C:/Users/22602/Desktop/SCARA/SCARA_F103/UserApp/home_controller.c:194:13:HomeController_StateName	16	static
