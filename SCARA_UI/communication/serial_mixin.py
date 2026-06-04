@@ -90,6 +90,22 @@ class ScaraSerialMixin:
                             self.log_display.append(
                                 f"<font color='orange'>MISMATCH expected_cs={ack.expected_checksum} rx_cs={ack.rx_checksum} expected_line={self.last_sent_package.strip()}</font>"
                             )
+                    
+                    # "通讯接收内容"模式：从ACK回传的line中提取坐标更新绘图
+                    if self.plot_mode_combo.currentText() == "通讯接收内容":
+                        # 从 ack.rx_line 中提取 X 和 Y 坐标
+                        if ack.rx_line:
+                            x_match = re.search(r'X([-?\d.]+)', ack.rx_line)
+                            y_match = re.search(r'Y([-?\d.]+)', ack.rx_line)
+                            if x_match and y_match:
+                                rx = float(x_match.group(1))
+                                ry = float(y_match.group(1))
+                                self.cur_x, self.cur_y = rx, ry
+                                self.history_x.append(rx)
+                                self.history_y.append(ry)
+                                ik = self.inverse_kinematics(rx, ry)
+                                if ik and ik[0] is not None:
+                                    self.update_plot(ik[0], ik[1])
                             
                     # 仅在非心跳的 ok 确认后，才推进队列
                     self.process_queue()

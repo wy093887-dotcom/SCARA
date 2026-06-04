@@ -73,6 +73,24 @@ class ScaraUiMixin:
         self.btns = {"UP": QPushButton("前进"), "DOWN": QPushButton("后退"), "LEFT": QPushButton("左移"), "RIGHT": QPushButton("右移")}
         for b in self.btns.values(): 
             b.setFixedSize(100, 30)
+        
+        # 电机单独控制按钮（四个角）
+        self.motor_btns = {
+            "M1_POS": QPushButton("M1+"),  # 电机1正向旋转
+            "M1_NEG": QPushButton("M1-"),  # 电机1逆向旋转
+            "M2_POS": QPushButton("M2+"),  # 电机2正向旋转
+            "M2_NEG": QPushButton("M2-"),  # 电机2逆向旋转
+        }
+        for b in self.motor_btns.values():
+            b.setFixedSize(100, 30)  # 与前后左右方向按钮等大
+            b.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold;")
+        
+        # 布局：四个角放置电机控制按钮，中心放置方向点动按钮
+        jog_grid.addWidget(self.motor_btns["M1_POS"], 0, 0)  # 左上角 - 电机1正向
+        jog_grid.addWidget(self.motor_btns["M2_POS"], 0, 2)  # 右上角 - 电机2正向
+        jog_grid.addWidget(self.motor_btns["M1_NEG"], 2, 0)  # 左下角 - 电机1逆向
+        jog_grid.addWidget(self.motor_btns["M2_NEG"], 2, 2)  # 右下角 - 电机2逆向
+        
         jog_grid.addWidget(self.btns["UP"], 0, 1)
         jog_grid.addWidget(self.btns["LEFT"], 1, 0)
         jog_grid.addWidget(self.btns["RIGHT"], 1, 2)
@@ -83,10 +101,18 @@ class ScaraUiMixin:
         jog_grid.addWidget(self.jog_speed_input, 1, 1)
         jog_group.setLayout(jog_grid)
         left_panel.addWidget(jog_group)
+        
+        # 方向点动连接
         self.btns["UP"].clicked.connect(lambda: self.add_jog(0, 10))
         self.btns["DOWN"].clicked.connect(lambda: self.add_jog(0, -10))
         self.btns["LEFT"].clicked.connect(lambda: self.add_jog(-10, 0))
         self.btns["RIGHT"].clicked.connect(lambda: self.add_jog(10, 0))
+        
+        # 电机单独控制连接（半步/半圈旋转）
+        self.motor_btns["M1_POS"].clicked.connect(lambda: self.motor_jog(1, 1))   # 电机1正向
+        self.motor_btns["M1_NEG"].clicked.connect(lambda: self.motor_jog(1, -1))  # 电机1逆向
+        self.motor_btns["M2_POS"].clicked.connect(lambda: self.motor_jog(2, 1))   # 电机2正向
+        self.motor_btns["M2_NEG"].clicked.connect(lambda: self.motor_jog(2, -1))  # 电机2逆向
 
         # 4. 轨迹规划
         interp_group = QGroupBox("轨迹规划")

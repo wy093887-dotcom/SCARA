@@ -36,7 +36,7 @@ class PlannerBlock:
 class LookAheadPlanner:
     """小型 look-ahead 规划器，输出带速度 F 的 G1 点流。"""
 
-    def __init__(self, accel_mm_s2: float = 100.0, junction_deviation: float = 0.02, sample_dt: float = 0.04):
+    def __init__(self, accel_mm_s2: float = 10.0, junction_deviation: float = 0.02, sample_dt: float = 0.04):
         self.accel_mm_s2 = max(1.0, accel_mm_s2)
         self.junction_deviation = max(0.001, junction_deviation)
         self.sample_dt = max(0.005, sample_dt)
