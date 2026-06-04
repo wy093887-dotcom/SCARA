@@ -32,7 +32,7 @@ class FiveBarSerialGUI(
         self.ser = None
         self.L0, self.L1, self.L2 = 150.0, 160.0, 200.0
         self.A, self.B = np.array([0, 0]), np.array([self.L0, 0])
-        self.HOME_X, self.HOME_Y = 75.0, 345.4
+        self.HOME_X, self.HOME_Y = 75.0, 220.0
 
         self.accel = 100.0
         self.junction_dev = 0.02
@@ -75,6 +75,7 @@ class FiveBarSerialGUI(
         self.ack_timeout_count = 0
         self.mcu_planner_free = 32
         self.stream_waiting_buffer = False
+        self.motion_preamble_needed = True
 
         self.board_only_debug = True
         self.is_homed = self.board_only_debug

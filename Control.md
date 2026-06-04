@@ -24,7 +24,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_project.ps1
 当前验证重点：
 
 ```text
-固件版本：0.23.1
+固件版本：0.23.2
 串口波特率：115200 8N1
 通信看门狗：默认关闭
 正式轨迹限位：上位机负责
@@ -78,6 +78,15 @@ G0 X-35.000 Y145.000 F600 ;ID=SEED LIM=1
 G1 X-34.900 Y145.000 F800 ;ID=0001 LIM=1
 ?
 ```
+
+使用 `SCARA_UI` 点动时，上位机会在第一条点动 G-code 前自动发送：
+
+```text
+CLEAR_ERROR
+ENABLE 1
+```
+
+这样可以避免刚烧录或刚急停后电机未使能，导致下位机在启动运动块时返回 `error:15`。`OK ENABLE 1`、`OK CLEAR_ERROR`、`OK ZERO` 只表示系统命令执行完成，不属于点动 G-code 的 `ok seq/cs/line` 回显，上位机不会用这些系统 OK 推进点动队列。
 
 ## 5. G-code 通信协议
 

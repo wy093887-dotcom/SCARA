@@ -173,7 +173,7 @@ class ScaraUiMixin:
         
         coord_group = QGroupBox("实时坐标")
         c_lay = QVBoxLayout()
-        self.status_label = QLabel("坐标: X=75.0, Y=345.4")
+        self.status_label = QLabel("坐标: X=75.0, Y=220.0")
         self.status_label.setFont(QFont("Arial", 11, QFont.Bold))
         self.status_label.setAlignment(Qt.AlignCenter)
         c_lay.addWidget(self.status_label)

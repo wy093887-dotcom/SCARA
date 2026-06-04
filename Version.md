@@ -1,5 +1,25 @@
 # SCARA_F103 Version Log
 
+## 2026-06-04 v0.23.2
+
+### 完成
+
+- 修复上位机点动时“下位机只动一下/随后报错”的通信状态机问题：
+  - `SCARA_UI` 现在只把带 `ok seq=<n> cs=<hex> line=<原始行>` 且与最近一条 G-code 完全匹配的响应当作运动 ACK。
+  - `OK ENABLE 1`、`OK CLEAR_ERROR`、`OK ZERO`、`OK VERSION` 等系统响应只记录日志，不再误触发点动队列继续发送。
+  - 点动发送第一条 G-code 前自动发送 `CLEAR_ERROR` 和 `ENABLE 1`，避免刚烧录、刚连接或上一轮错误后电机未使能导致 `error:15`。
+- 调整上位机错误处理：
+  - `error:8` 仍按下位机 pending/buffer 忙处理，暂停发送并等待状态恢复。
+  - `error:15` 改为暂停当前点动队列、查询 `ERRORS` 和 `?` 状态，不再自动发送 `ESTOP`，避免把可恢复的运动拒绝升级成急停锁定。
+- 固件版本号更新为 `0.23.2`，并同步更新自检脚本和 `Control.md`。
+- 修正 `tools/verify_project.ps1` 的文件清单，移除当前工程已不再保留的 `tools/robot_upper_sim` 检查项，避免自检被历史文件要求误判失败。
+
+### 原因
+
+- 下位机协议中普通系统命令返回 `OK ...`，正式 G-code 返回 `ok seq/cs/line`。
+- 旧上位机逻辑只判断响应是否以 `ok` 开头，可能把系统 OK 当成点动 ACK。
+- STM32F103 固件上电后步进电机默认未使能；若上位机直接发送点动 G-code，下位机接收/入队会返回 `ok`，但实际启动运动块时会因为 `STEPPER_ERR_DISABLED` 返回 `error:15`。
+
 ## 2026-06-03 v0.23.1
 
 - Changed trajectory limit ownership to the host side:

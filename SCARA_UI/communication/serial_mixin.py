@@ -9,6 +9,26 @@ from .serial_protocol import build_g1_line, parse_ok_ack
 
 
 class ScaraSerialMixin:
+    def ui_to_mcu_xy(self, x, y):
+        return x - self.L0 * 0.5, y
+
+    def mcu_to_ui_xy(self, x, y):
+        return x + self.L0 * 0.5, y
+
+    def _write_motion_preamble(self):
+        if not self.ser or not self.ser.is_open or not self.motion_preamble_needed:
+            return
+        for cmd in ("CLEAR_ERROR", "ENABLE 1"):
+            self.ser.write((cmd + "\n").encode('ascii'))
+            self.log_display.append(
+                f"<font color='#bbbbbb'>TX {self.get_timestamp()} [MOTION_PREP] {cmd}</font>"
+            )
+        self.motion_preamble_needed = False
+
+    def _request_controller_diagnostics(self):
+        if self.ser and self.ser.is_open:
+            self.ser.write(b"ERRORS\n?\n")
+
     def refresh_ports(self):
         self.port_combo.clear()
         ps = [p.device for p in serial.tools.list_ports.comports()]
@@ -24,6 +44,7 @@ class ScaraSerialMixin:
                 self.serial_status.setText("已连接")
                 self.serial_status.setStyleSheet("color: green;")
                 self.btn_connect.setText("断开")
+                self.motion_preamble_needed = True
                 self.heartbeat_timer.start(200) 
             except Exception as e:
                 self.log_error(f"连接失败: {e}")
@@ -71,25 +92,36 @@ class ScaraSerialMixin:
                     # 心跳响应在此处终结，绝对不执行后续运动队列逻辑
                     return 
 
-                # 2. 处理运动指令或系统配置的确认回传 (Movement OK)
+                # 2. 处理运动指令 ACK；系统 OK 只记录，不推进运动队列。
                 if raw.lower().startswith("ok"):
                     ts = self.get_timestamp()
+                    ack = parse_ok_ack(raw, self.last_sent_package.strip())
+
+                    if not (ack.rx_checksum and ack.rx_line):
+                        self.log_display.append(f"<font color='#98c379'>RX {ts} [OK] {raw}</font>")
+                        return
+
+                    if not ack.matched:
+                        self.log_display.append(
+                            f"<font color='orange'>RX {ts} [OUT_OF_BAND_ACK] {raw}</font>"
+                        )
+                        self.log_display.append(
+                            f"<font color='orange'>MISMATCH expected_cs={ack.expected_checksum} rx_cs={ack.rx_checksum} expected_line={self.last_sent_package.strip()}</font>"
+                        )
+                        return
+
+                    if not self.waiting_for_ack:
+                        self.log_display.append(f"<font color='orange'>RX {ts} [STALE_ACK] {raw}</font>")
+                        return
+
                     self.timeout_timer.stop()
                     self.waiting_for_ack = False
                     self.ack_timeout_count = 0
                     self.stream_waiting_buffer = False
                     self.last_sent_motion = None
-                    
+
                     self.log_display.append(f"<font color='#ffffff'>RX {ts} [ACK {self.sent_point_id}/{self.total_task_points}] {raw}</font>")
-                    
-                    ack = parse_ok_ack(raw, self.last_sent_package.strip())
-                    if ack.rx_checksum and ack.rx_line:
-                        if ack.matched:
-                            self.log_display.append(f"<font color='#00ff99'>MATCH cs={ack.expected_checksum} line=OK</font>")
-                        else:
-                            self.log_display.append(
-                                f"<font color='orange'>MISMATCH expected_cs={ack.expected_checksum} rx_cs={ack.rx_checksum} expected_line={self.last_sent_package.strip()}</font>"
-                            )
+                    self.log_display.append(f"<font color='#00ff99'>MATCH cs={ack.expected_checksum} line=OK</font>")
                     
                     # "通讯接收内容"模式：从ACK回传的line中提取坐标更新绘图
                     if self.plot_mode_combo.currentText() == "通讯接收内容":
@@ -98,8 +130,7 @@ class ScaraSerialMixin:
                             x_match = re.search(r'X([-?\d.]+)', ack.rx_line)
                             y_match = re.search(r'Y([-?\d.]+)', ack.rx_line)
                             if x_match and y_match:
-                                rx = float(x_match.group(1))
-                                ry = float(y_match.group(1))
+                                rx, ry = self.mcu_to_ui_xy(float(x_match.group(1)), float(y_match.group(1)))
                                 self.cur_x, self.cur_y = rx, ry
                                 self.history_x.append(rx)
                                 self.history_y.append(ry)
@@ -107,7 +138,7 @@ class ScaraSerialMixin:
                                 if ik and ik[0] is not None:
                                     self.update_plot(ik[0], ik[1])
                             
-                    # 仅在非心跳的 ok 确认后，才推进队列
+                    # 只有匹配当前 G-code 的 ACK 才能推进队列，避免 OK ENABLE/OK ZERO 误触发点动发送。
                     self.process_queue()
                     return
 
@@ -137,7 +168,7 @@ class ScaraSerialMixin:
                     if self.plot_mode_combo.currentText() == "通讯接收内容":
                         match = re.search(r'M:([-?\d.]+),([-?\d.]+)', raw)
                         if match:
-                            rx, ry = float(match.group(1)), float(match.group(2))
+                            rx, ry = self.mcu_to_ui_xy(float(match.group(1)), float(match.group(2)))
                             self.cur_x, self.cur_y = rx, ry
                             self.history_x.append(rx)
                             self.history_y.append(ry)
@@ -170,6 +201,17 @@ class ScaraSerialMixin:
                         self.waiting_for_ack = False
                         self.timeout_timer.stop()
                         return
+                    if raw.lower().startswith("error:15"):
+                        self.log_display.append(
+                            "<font color='orange'>运动被下位机拒绝，暂停队列并查询 ERRORS/状态；不自动急停。</font>"
+                        )
+                        self.point_queue = []
+                        self.waiting_for_ack = False
+                        self.timeout_timer.stop()
+                        self.last_sent_motion = None
+                        self.motion_preamble_needed = True
+                        self._request_controller_diagnostics()
+                        return
                     self.emergency_stop()
                     return
 
@@ -201,7 +243,8 @@ class ScaraSerialMixin:
         tx, ty, feed_rate, slt = self.point_queue.pop(0)
         self.last_sent_motion = (tx, ty, feed_rate, slt)
         self.sent_point_id += 1
-        gcode_raw = build_g1_line(tx, ty, feed_rate, self.sent_point_id, limit_checked=True)
+        mcu_tx, mcu_ty = self.ui_to_mcu_xy(tx, ty)
+        gcode_raw = build_g1_line(mcu_tx, mcu_ty, feed_rate, self.sent_point_id, limit_checked=True)
         gcode_line = gcode_raw + "\n"
         self.last_sent_cs = self.calculate_checksum(gcode_raw)
         self.last_sent_package = gcode_raw
@@ -215,6 +258,7 @@ class ScaraSerialMixin:
         log_msg = f"TX {ts} [point {self.sent_point_id}/{self.total_task_points}] cs={self.last_sent_cs} len={len(gcode_line)} line={gcode_raw}"
         self.log_display.append(f"<font color='#ffffff'>{log_msg}</font>")
         if self.ser and self.ser.is_open:
+            self._write_motion_preamble()
             self.ser.write(gcode_line.encode('ascii'))
             self.waiting_for_ack = True  
             self.timeout_timer.start(1000) 

@@ -81,6 +81,10 @@ class ScaraMotionMixin:
             self.home_sensor_triggered = False
             self.point_queue = []
             self.waiting_for_ack = False
+            self.motion_preamble_needed = True
+            self.cur_x, self.cur_y = self.HOME_X, self.HOME_Y
+            self.history_x, self.history_y = [self.cur_x], [self.cur_y]
+            self.update_plot()
             self.timeout_timer.stop()
             self.log_display.append(
                 "<font color='yellow'>BOARD_ONLY_DEBUG: 未接 HOME 开关，跳过真实 $H，发送 ZERO 作为软件零点。</font>"
@@ -96,6 +100,7 @@ class ScaraMotionMixin:
         
     def emergency_stop(self):
         self.point_queue = []; self.waiting_for_ack = False; self.timeout_timer.stop()
+        self.motion_preamble_needed = True
         ts = self.get_timestamp(); self.log_display.append(f"<font color='#e74c3c'>TX {ts} ESTOP (急停)</font>")
         if self.ser and self.ser.is_open: self.ser.write(b"ESTOP\n")
             
