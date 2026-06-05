@@ -5,6 +5,10 @@ import numpy as np
 class ScaraMotionMixin:
     JOINT_LIMITS_DEG = ((-180.0, 180.0), (0.0, 360.0))
     ARC_SEGMENT_MM = 2.0
+    DEFAULT_CORNER_RADIUS_MM = 2.0
+    CAR_CORNER_RADIUS_MM = 1.0
+    PATH_SIMPLIFY_TOLERANCE_MM = 0.18
+    PATH_MIN_POINT_SPACING_MM = 0.20
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
@@ -123,20 +127,59 @@ class ScaraMotionMixin:
 
     def generate_polyline_path(self, points, speed_max, silent_first=False):
         # 上位机按真实弧长预先规划速度；下位机只接收带 F 的 G1 点流。
-        clean_points = []
-        for x, y in points:
-            if not clean_points or np.hypot(x - clean_points[-1][0], y - clean_points[-1][1]) > 0.001:
-                clean_points.append((x, y))
+        clean_points = self.preprocess_control_points(points)
         if len(clean_points) < 2:
             self.log_error("轨迹点过少，至少需要起点和终点")
             return []
         if not self.validate_trajectory_points(clean_points, "轨迹控制点"):
             return []
-        planned = self.path_planner.plan_polyline(clean_points, feed_mm_s=speed_max, silent_first=silent_first)
+        planned = self.path_planner.plan_rounded_polyline(
+            clean_points,
+            feed_mm_s=speed_max,
+            corner_radius_mm=self.DEFAULT_CORNER_RADIUS_MM,
+            silent_first=silent_first,
+        )
         path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
         if path and not self.validate_trajectory_points(path, "轨迹采样点"):
             return []
         return path
+
+    def preprocess_control_points(self, points, simplify_tolerance=None, min_spacing=None):
+        simplify_tolerance = self.PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else simplify_tolerance
+        min_spacing = self.PATH_MIN_POINT_SPACING_MM if min_spacing is None else min_spacing
+        clean = []
+        for x, y in points:
+            p = (float(x), float(y))
+            if not clean or np.hypot(p[0] - clean[-1][0], p[1] - clean[-1][1]) >= min_spacing:
+                clean.append(p)
+        if len(clean) > 2 and simplify_tolerance > 0:
+            clean = self._rdp_points(clean, simplify_tolerance)
+        return clean
+
+    def _rdp_points(self, points, epsilon):
+        if len(points) <= 2:
+            return list(points)
+        start = points[0]
+        end = points[-1]
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.hypot(dx, dy)
+        max_dist = -1.0
+        split_index = 0
+        for index in range(1, len(points) - 1):
+            px, py = points[index]
+            if length <= 1e-9:
+                dist = math.hypot(px - start[0], py - start[1])
+            else:
+                dist = abs(dy * px - dx * py + end[0] * start[1] - end[1] * start[0]) / length
+            if dist > max_dist:
+                max_dist = dist
+                split_index = index
+        if max_dist > epsilon:
+            left = self._rdp_points(points[: split_index + 1], epsilon)
+            right = self._rdp_points(points[split_index:], epsilon)
+            return left[:-1] + right
+        return [start, end]
 
     def generate_geometry_path(self, segments, speed_max, silent_first=False, label="固定轨迹"):
         control_points = []
@@ -286,39 +329,58 @@ class ScaraMotionMixin:
     def _arc(self, origin, p0, p1, radius, clockwise):
         return self._make_arc_segment(self._offset_point(origin, p0), self._offset_point(origin, p1), radius, clockwise)
 
+    def _rounded_chain(self, origin, points, radius=None, keep_corners=None):
+        radius = self.DEFAULT_CORNER_RADIUS_MM if radius is None else radius
+        keep_corners = set(keep_corners or [])
+        if not keep_corners:
+            absolute = [self._offset_point(origin, point) for point in points]
+            return self.path_planner.rounded_polyline_segments(absolute, corner_radius_mm=radius)
+
+        segments = []
+        chunk = [points[0]]
+        for index in range(1, len(points)):
+            chunk.append(points[index])
+            if index in keep_corners and len(chunk) >= 2:
+                absolute = [self._offset_point(origin, point) for point in chunk]
+                segments.extend(self.path_planner.rounded_polyline_segments(absolute, corner_radius_mm=radius))
+                chunk = [points[index]]
+        if len(chunk) >= 2:
+            absolute = [self._offset_point(origin, point) for point in chunk]
+            segments.extend(self.path_planner.rounded_polyline_segments(absolute, corner_radius_mm=radius))
+        return segments
+
     def build_car1_segments(self, x0, y0):
         origin = (x0, y0)
-        raw = [
-            self._line(origin, (0, 0), (0, 24)),
-            self._line(origin, (0, 24), (72, 24)),
-            self._line(origin, (72, 24), (72, 48)),
-            self._line(origin, (72, 48), (108, 48)),
-            self._line(origin, (108, 48), (120, 36)),
-            self._line(origin, (120, 36), (120, 0)),
-            self._line(origin, (120, 0), (108, 0)),
-            self._arc(origin, (108, 0), (84, 0), 12, clockwise=True),
-            self._line(origin, (84, 0), (48, 0)),
-            self._arc(origin, (48, 0), (24, 0), 12, clockwise=True),
-            self._line(origin, (24, 0), (0, 0)),
-        ]
+        raw = []
+        raw.extend(
+            self._rounded_chain(
+                origin,
+                [(0, 0), (0, 24), (72, 24), (72, 48), (108, 48), (120, 36), (120, 0), (108, 0)],
+                radius=self.CAR_CORNER_RADIUS_MM,
+                keep_corners={4, 5},
+            )
+        )
+        raw.append(self._arc(origin, (108, 0), (84, 0), 12, clockwise=True))
+        raw.append(self._line(origin, (84, 0), (48, 0)))
+        raw.append(self._arc(origin, (48, 0), (24, 0), 12, clockwise=True))
+        raw.append(self._line(origin, (24, 0), (0, 0)))
         return [segment for segment in raw if segment is not None]
 
     def build_car2_segments(self, x0, y0):
         origin = (x0, y0)
-        raw = [
-            self._line(origin, (0, 0), (0, 20)),
-            self._line(origin, (0, 20), (40, 20)),
-            self._line(origin, (40, 20), (60, 40)),
-            self._line(origin, (60, 40), (120, 40)),
-            self._line(origin, (120, 40), (140, 20)),
-            self._line(origin, (140, 20), (160, 20)),
-            self._line(origin, (160, 20), (160, 0)),
-            self._line(origin, (160, 0), (140, 0)),
-            self._arc(origin, (140, 0), (116, 0), 12, clockwise=True),
-            self._line(origin, (116, 0), (44, 0)),
-            self._arc(origin, (44, 0), (20, 0), 12, clockwise=True),
-            self._line(origin, (20, 0), (0, 0)),
-        ]
+        raw = []
+        raw.extend(
+            self._rounded_chain(
+                origin,
+                [(0, 0), (0, 20), (40, 20), (60, 40), (120, 40), (140, 20), (160, 20), (160, 0), (140, 0)],
+                radius=self.CAR_CORNER_RADIUS_MM,
+                keep_corners={3, 4, 5},
+            )
+        )
+        raw.append(self._arc(origin, (140, 0), (116, 0), 12, clockwise=True))
+        raw.append(self._line(origin, (116, 0), (44, 0)))
+        raw.append(self._arc(origin, (44, 0), (20, 0), 12, clockwise=True))
+        raw.append(self._line(origin, (20, 0), (0, 0)))
         return [segment for segment in raw if segment is not None]
 
     def plan_car_path(self):
@@ -347,6 +409,200 @@ class ScaraMotionMixin:
         except Exception as e:
             self.log_error(f"小车轨迹2规划错误: {e}")
 
+    def generate_stroke_path(self, strokes, speed_max, label="写字轨迹"):
+        path = []
+        current = (self.cur_x, self.cur_y)
+        valid_strokes = []
+        for stroke in strokes:
+            clean = self.preprocess_control_points(
+                stroke,
+                simplify_tolerance=self.PATH_SIMPLIFY_TOLERANCE_MM,
+                min_spacing=self.PATH_MIN_POINT_SPACING_MM,
+            )
+            if len(clean) >= 2:
+                valid_strokes.append(clean)
+
+        if not valid_strokes:
+            self.log_error(f"{label}没有足够的有效笔画")
+            return []
+
+        for stroke in valid_strokes:
+            if math.hypot(stroke[-1][0] - current[0], stroke[-1][1] - current[1]) < math.hypot(
+                stroke[0][0] - current[0], stroke[0][1] - current[1]
+            ):
+                stroke = list(reversed(stroke))
+            first = stroke[0]
+            if math.hypot(first[0] - current[0], first[1] - current[1]) > 0.01:
+                connector = self.generate_linear_path(current[0], current[1], first[0], first[1], speed_max, silent=True)
+                if not connector:
+                    return []
+                path.extend(connector)
+
+            if not self.validate_trajectory_points(stroke, f"{label}控制点"):
+                return []
+            planned = self.path_planner.plan_rounded_polyline(
+                stroke,
+                feed_mm_s=speed_max,
+                corner_radius_mm=self.DEFAULT_CORNER_RADIUS_MM,
+                silent_first=False,
+            )
+            stroke_path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
+            if stroke_path and not self.validate_trajectory_points(stroke_path, f"{label}采样点"):
+                return []
+            path.extend(stroke_path)
+            current = stroke[-1]
+
+        return path
+
+    def _order_text_strokes(self, strokes):
+        boxed = []
+        for stroke in strokes:
+            xs = [point[0] for point in stroke]
+            ys = [point[1] for point in stroke]
+            boxed.append(
+                {
+                    "stroke": stroke,
+                    "min_x": min(xs),
+                    "max_x": max(xs),
+                    "min_y": min(ys),
+                    "max_y": max(ys),
+                    "center_y": (min(ys) + max(ys)) * 0.5,
+                }
+            )
+        if not boxed:
+            return []
+
+        avg_height = sum(item["max_y"] - item["min_y"] for item in boxed) / max(1, len(boxed))
+        row_threshold = max(6.0, avg_height * 0.45)
+        rows = []
+        for item in sorted(boxed, key=lambda x: -x["center_y"]):
+            for row in rows:
+                if abs(row["center_y"] - item["center_y"]) <= row_threshold:
+                    row["items"].append(item)
+                    row["center_y"] = sum(member["center_y"] for member in row["items"]) / len(row["items"])
+                    break
+            else:
+                rows.append({"center_y": item["center_y"], "items": [item]})
+
+        ordered = []
+        for row in sorted(rows, key=lambda x: -x["center_y"]):
+            for item in sorted(row["items"], key=lambda x: (x["min_x"], -x["max_y"])):
+                ordered.append(item["stroke"])
+        return ordered
+
+    def handwriting_strokes_to_robot(self, strokes):
+        robot_strokes = []
+        width_mm = 120.0
+        height_mm = 85.0
+        left = self.HOME_X - width_mm * 0.5
+        bottom = self.HOME_Y - height_mm * 0.5
+        for stroke in strokes:
+            converted = []
+            for x_norm, y_norm in stroke:
+                converted.append((left + float(x_norm) * width_mm, bottom + (1.0 - float(y_norm)) * height_mm))
+            if len(converted) >= 2:
+                robot_strokes.append(converted)
+        return robot_strokes
+
+    def plan_handwriting_preview(self):
+        try:
+            strokes = self.handwriting_strokes_to_robot(self.handwriting_pad.normalized_strokes())
+            v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
+            path = self.generate_stroke_path(strokes, v, label="手写轨迹")
+            if path:
+                self.preview_planned_path(path, "手写轨迹")
+                self.log_display.append(f"<font color='cyan'>手写轨迹预览完成: {len(path)} 点</font>")
+        except Exception as e:
+            self.log_error(f"手写轨迹预览错误: {e}")
+
+    def plan_handwriting_path(self):
+        try:
+            strokes = self.handwriting_strokes_to_robot(self.handwriting_pad.normalized_strokes())
+            v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
+            path = self.generate_stroke_path(strokes, v, label="手写轨迹")
+            if path:
+                self.preview_planned_path(path, "手写轨迹")
+                self.load_motion_queue(path)
+                self.log_display.append(f"<font color='cyan'>手写轨迹已装载: {len(path)} 点</font>")
+        except Exception as e:
+            self.log_error(f"手写轨迹规划错误: {e}")
+
+    def clear_handwriting(self):
+        if hasattr(self, "handwriting_pad"):
+            self.handwriting_pad.clear()
+        self.preview_x, self.preview_y = [], []
+        self.preview_label = ""
+        self.update_plot()
+
+    def build_text_outline_strokes(self, text, max_width_mm=135.0, max_height_mm=85.0):
+        from PySide6.QtGui import QFont, QFontDatabase, QPainterPath, QTransform
+        from PySide6.QtWidgets import QApplication
+
+        if QApplication.instance() is None:
+            self._text_outline_qt_app = QApplication([])
+
+        try:
+            families = set(QFontDatabase.families())
+        except TypeError:
+            families = set(QFontDatabase().families())
+        family = "Microsoft YaHei" if "Microsoft YaHei" in families else QFont().family()
+        font = QFont(family, 100)
+        painter_path = QPainterPath()
+        painter_path.addText(0.0, 0.0, font, text)
+        polygons = painter_path.toSubpathPolygons(QTransform())
+
+        raw_strokes = []
+        all_points = []
+        for polygon in polygons:
+            points = [(float(point.x()), float(point.y())) for point in polygon]
+            if len(points) < 3:
+                continue
+            if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) > 0.01:
+                points.append(points[0])
+            raw_strokes.append(points)
+            all_points.extend(points)
+
+        if not all_points:
+            return []
+
+        min_x = min(p[0] for p in all_points)
+        max_x = max(p[0] for p in all_points)
+        min_y = min(p[1] for p in all_points)
+        max_y = max(p[1] for p in all_points)
+        text_w = max(1.0, max_x - min_x)
+        text_h = max(1.0, max_y - min_y)
+        scale = min(max_width_mm / text_w, max_height_mm / text_h)
+        out_w = text_w * scale
+        out_h = text_h * scale
+        left = self.HOME_X - out_w * 0.5
+        bottom = self.HOME_Y - out_h * 0.5
+
+        strokes = []
+        for raw in raw_strokes:
+            converted = []
+            for x, y in raw:
+                rx = left + (x - min_x) * scale
+                ry = bottom + (max_y - y) * scale
+                converted.append((rx, ry))
+            clean = self.preprocess_control_points(converted, simplify_tolerance=0.18, min_spacing=0.35)
+            if len(clean) >= 3:
+                if math.hypot(clean[0][0] - clean[-1][0], clean[0][1] - clean[-1][1]) > 0.35:
+                    clean.append(clean[0])
+                strokes.append(clean)
+        return self._order_text_strokes(strokes)
+
+    def plan_fixed_text_path(self, text):
+        try:
+            v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
+            strokes = self.build_text_outline_strokes(text)
+            path = self.generate_stroke_path(strokes, v, label=f"空心字{text}")
+            if path:
+                self.preview_planned_path(path, f"空心字{text}")
+                self.load_motion_queue(path)
+                self.log_display.append(f"<font color='cyan'>空心字{text}已装载: {len(path)} 点</font>")
+        except Exception as e:
+            self.log_error(f"空心字{text}规划错误: {e}")
+
     def system_reset(self): 
         if self.board_only_debug:
             # 当前仅连接控制板，没有接 HOME 微动开关与电机，先用软件零点完成串口和队列调试。
@@ -372,12 +628,36 @@ class ScaraMotionMixin:
             self.ser.write((cmd + "\n").encode('ascii')); self.waiting_for_ack = True; self.timeout_timer.start(10000) 
         else: self.log_error("串口未连接")
         
-    def emergency_stop(self):
-        self.point_queue = []; self.waiting_for_ack = False; self.timeout_timer.stop()
+    def stop_motion(self):
+        self.point_queue = []
+        self.waiting_for_ack = False
+        self.stream_waiting_buffer = False
+        self.last_sent_motion = None
         self.motion_preamble_needed = True
-        ts = self.get_timestamp(); self.log_display.append(f"<font color='#e74c3c'>TX {ts} ESTOP (急停)</font>")
-        if self.ser and self.ser.is_open: self.ser.write(b"ESTOP\n")
-            
+        self.timeout_timer.stop()
+        ts = self.get_timestamp()
+        self.log_display.append(
+            f"<font color='#f39c12'>TX {ts} STOP (\u505c\u6b62\uff1a\u6e05\u9664\u4e0a\u4f4d\u673a\u961f\u5217)</font>"
+        )
+        if self.ser and self.ser.is_open:
+            self.ser.write(b"STOP\n")
+
+    def emergency_stop(self):
+        if self.last_sent_motion is not None:
+            self.point_queue.insert(0, self.last_sent_motion)
+            self.last_sent_motion = None
+            self.sent_point_id = max(0, self.sent_point_id - 1)
+        self.waiting_for_ack = False
+        self.stream_waiting_buffer = False
+        self.motion_preamble_needed = True
+        self.timeout_timer.stop()
+        ts = self.get_timestamp()
+        self.log_display.append(
+            f"<font color='#e74c3c'>TX {ts} ESTOP (\u6025\u505c\uff1a\u4fdd\u7559\u4e0a\u4f4d\u673a\u961f\u5217)</font>"
+        )
+        if self.ser and self.ser.is_open:
+            self.ser.write(b"ESTOP\n")
+
     def add_jog(self, dx, dy):
         try:
             v_max = float(self.jog_speed_input.text())
@@ -392,7 +672,8 @@ class ScaraMotionMixin:
                 self.update_plot()
             tx, ty = sx + dx, sy + dy
             if self.check_workspace_safety(tx, ty):
-                path = self.generate_linear_path(sx, sy, tx, ty, v_max, v_start=0.0, v_end=0.0)
+                blend_speed = min(v_max * 0.35, 8.0) if (self.waiting_for_ack or self.point_queue) else 0.0
+                path = self.generate_linear_path(sx, sy, tx, ty, v_max, v_start=blend_speed, v_end=blend_speed)
                 if not path:
                     self.log_error("点动距离过短，未生成轨迹")
                     return

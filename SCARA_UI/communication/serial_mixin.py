@@ -5,7 +5,7 @@ import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QTimer
 
-from .serial_protocol import build_g1_line, parse_ok_ack
+from .serial_protocol import build_g1_line, build_ppr_line, parse_ok_ack
 
 
 class ScaraSerialMixin:
@@ -45,6 +45,8 @@ class ScaraSerialMixin:
                 self.serial_status.setStyleSheet("color: green;")
                 self.btn_connect.setText("断开")
                 self.motion_preamble_needed = True
+                self.microstep_dirty = True
+                self.apply_microstep_setting()
                 self.heartbeat_timer.start(200) 
             except Exception as e:
                 self.log_error(f"连接失败: {e}")
@@ -65,6 +67,8 @@ class ScaraSerialMixin:
         if not path:
             self.log_error("未生成有效轨迹")
             return
+        if getattr(self, "microstep_dirty", False) and self.ser and self.ser.is_open:
+            self.apply_microstep_setting()
         if append and (self.waiting_for_ack or self.point_queue):
             self.point_queue.extend(path)
             self.total_task_points += len(path)
@@ -74,6 +78,31 @@ class ScaraSerialMixin:
             self.task_start_time = time.time()
             self.point_queue = path
         self.process_queue()
+
+    def on_microstep_changed(self):
+        self.microstep_dirty = True
+        if self.ser and self.ser.is_open and not self.waiting_for_ack and not self.point_queue:
+            self.apply_microstep_setting()
+
+    def apply_microstep_setting(self):
+        try:
+            ppr = int(self.microstep_combo.currentText())
+        except Exception as exc:
+            self.log_error(f"细分/脉冲参数错误: {exc}")
+            return False
+        if self.waiting_for_ack or self.point_queue:
+            self.log_display.append("<font color='yellow'>PPR 参数将在当前队列结束后应用</font>")
+            return False
+        if not (self.ser and self.ser.is_open):
+            self.microstep_dirty = True
+            return False
+        line = build_ppr_line(ppr)
+        if self.send_ascii_line(line, "PPR"):
+            self.current_ppr = ppr
+            self.microstep_dirty = False
+            self.send_ascii_line("PARAMS", "PARAMS")
+            return True
+        return False
 
     def check_serial_feedback(self):
         if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
@@ -140,6 +169,17 @@ class ScaraSerialMixin:
 
                     q_match = re.search(r'Q:(\d+)', raw)
                     if q_match: self.lbl_mcu_queue.setText(f"队列负载(Q): {q_match.group(1)}")
+
+                    pulse_match = re.search(r'P:([-?\d]+),([-?\d]+)', raw)
+                    a1_match = re.search(r'A1:(\d+),(\d+),([-?\d]+),([-?\d]+)', raw)
+                    a2_match = re.search(r'A2:(\d+),(\d+),([-?\d]+),([-?\d]+)', raw)
+                    if pulse_match:
+                        self.feedback_p1 = int(pulse_match.group(1))
+                        self.feedback_p2 = int(pulse_match.group(2))
+                    if a1_match:
+                        self.feedback_a1_pps = (int(a1_match.group(3)), int(a1_match.group(4)))
+                    if a2_match:
+                        self.feedback_a2_pps = (int(a2_match.group(3)), int(a2_match.group(4)))
                     
                     h_match = re.search(r'H:(\d),(\d)', raw)
                     if h_match:
@@ -154,6 +194,24 @@ class ScaraSerialMixin:
                     match = re.search(r'M:([-?\d.]+),([-?\d.]+)', raw)
                     if match:
                         rx, ry = self.mcu_to_ui_xy(float(match.group(1)), float(match.group(2)))
+                        q1, q2 = self.inverse_kinematics(rx, ry)
+                        if hasattr(self, "feedback_pose_label"):
+                            self.feedback_pose_label.setText(f"回传末端: X={rx:.3f}, Y={ry:.3f}")
+                        if hasattr(self, "feedback_joint_label"):
+                            if q1 is None or q2 is None:
+                                self.feedback_joint_label.setText("回传角度: M1=不可解, M2=不可解")
+                            else:
+                                self.feedback_joint_label.setText(f"回传角度: M1={q1:.2f} deg, M2={q2:.2f} deg")
+                        if hasattr(self, "feedback_pulse_label"):
+                            p1 = getattr(self, "feedback_p1", None)
+                            p2 = getattr(self, "feedback_p2", None)
+                            a1 = getattr(self, "feedback_a1_pps", (None, None))
+                            a2 = getattr(self, "feedback_a2_pps", (None, None))
+                            self.feedback_pulse_label.setText(
+                                f"脉冲/PPS: P={p1 if p1 is not None else '--'},{p2 if p2 is not None else '--'}  "
+                                f"A1={a1[0] if a1[0] is not None else '--'}/{a1[1] if a1[1] is not None else '--'}  "
+                                f"A2={a2[0] if a2[0] is not None else '--'}/{a2[1] if a2[1] is not None else '--'}"
+                            )
                         if hasattr(self, "append_feedback_point"):
                             self.append_feedback_point(rx, ry)
                         if getattr(self, "velocity_monitor", None) is not None:

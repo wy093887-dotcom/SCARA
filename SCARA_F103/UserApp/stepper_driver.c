@@ -17,12 +17,13 @@ typedef struct {
     GPIO_TypeDef *ena_port;
     uint16_t ena_pin;
     int32_t pulse_accum;
+    int32_t applied_pps;
 } StepperHw;
 
 static StepperState s_state;
 static StepperHw s_hw[2] = {
-    {BOARD_M1_TIM, BOARD_M1_TIM_CHANNEL, BOARD_M1_DIR_PORT, BOARD_M1_DIR_PIN, BOARD_M1_ENA_PORT, BOARD_M1_ENA_PIN, 0},
-    {BOARD_M2_TIM, BOARD_M2_TIM_CHANNEL, BOARD_M2_DIR_PORT, BOARD_M2_DIR_PIN, BOARD_M2_ENA_PORT, BOARD_M2_ENA_PIN, 0},
+    {BOARD_M1_TIM, BOARD_M1_TIM_CHANNEL, BOARD_M1_DIR_PORT, BOARD_M1_DIR_PIN, BOARD_M1_ENA_PORT, BOARD_M1_ENA_PIN, 0, 0},
+    {BOARD_M2_TIM, BOARD_M2_TIM_CHANNEL, BOARD_M2_DIR_PORT, BOARD_M2_DIR_PIN, BOARD_M2_ENA_PORT, BOARD_M2_ENA_PIN, 0, 0},
 };
 
 static int32_t clamp_i32(int32_t value, int32_t min_value, int32_t max_value)
@@ -68,12 +69,20 @@ static void pwm_apply(uint32_t index, int32_t pps)
     int32_t abs_pps = abs(pps);
 
     if (abs_pps < APP_MIN_EFFECTIVE_PPS || !s_state.axis[index].enabled) {
-        __HAL_TIM_SET_COMPARE(tim, channel, 0);
+        if (s_hw[index].applied_pps != 0) {
+            __HAL_TIM_SET_COMPARE(tim, channel, 0);
+            s_hw[index].applied_pps = 0;
+        }
         s_state.axis[index].running = false;
         return;
     }
 
     abs_pps = clamp_i32(abs_pps, APP_MIN_EFFECTIVE_PPS, s_state.axis[index].max_pps);
+    pps = pps < 0 ? -abs_pps : abs_pps;
+    if (s_hw[index].applied_pps == pps) {
+        s_state.axis[index].running = true;
+        return;
+    }
     uint32_t arr = (APP_STEPPER_TIMER_HZ / (uint32_t)abs_pps);
     if (arr == 0u) {
         arr = 1u;
@@ -83,6 +92,7 @@ static void pwm_apply(uint32_t index, int32_t pps)
     __HAL_TIM_SET_AUTORELOAD(tim, arr);
     __HAL_TIM_SET_COMPARE(tim, channel, (arr + 1u) / 2u);
     __HAL_TIM_SET_COUNTER(tim, 0u);
+    s_hw[index].applied_pps = pps;
     s_state.axis[index].running = true;
 }
 
@@ -138,6 +148,7 @@ void Stepper_Init(void)
         s_state.axis[i].remaining_pulse = 0;
         s_state.axis[i].error = 0;
         s_hw[i].pulse_accum = 0;
+        s_hw[i].applied_pps = 0;
         HAL_TIM_PWM_Start(s_hw[i].tim, s_hw[i].channel);
         pwm_apply(i, 0);
         HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, GPIO_PIN_SET);

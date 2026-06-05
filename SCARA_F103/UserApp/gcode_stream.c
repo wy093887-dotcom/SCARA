@@ -81,9 +81,30 @@ static int32_t i32_abs(int32_t v)
     return v < 0 ? -v : v;
 }
 
-static int32_t i32_max(int32_t a, int32_t b)
+static int32_t i32_isqrt_i64(int64_t value)
 {
-    return a > b ? a : b;
+    int64_t bit = 1LL << 62;
+    int64_t result = 0;
+
+    if (value <= 0) {
+        return 0;
+    }
+    while (bit > value) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (value >= result + bit) {
+            value -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+    if (result > 2147483647LL) {
+        return 2147483647;
+    }
+    return (int32_t)result;
 }
 
 static int16_t pps_to_i16(int32_t pps)
@@ -279,7 +300,7 @@ static bool build_motion_block(int32_t target_x_um, int32_t target_y_um, uint8_t
     int64_t dp2 = p2 - (int64_t)s_gc.p2;
     int32_t dx = target_x_um - s_gc.x_um;
     int32_t dy = target_y_um - s_gc.y_um;
-    int32_t dist_um = i32_max(i32_abs(dx), i32_abs(dy));
+    int32_t dist_um = i32_isqrt_i64((int64_t)dx * (int64_t)dx + (int64_t)dy * (int64_t)dy);
     if (dist_um < 1) {
         dist_um = 1;
     }

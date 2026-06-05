@@ -3,6 +3,7 @@
 /* 调试/安全文本协议：处理 VERSION、STATUS、HOSTCAP、ENABLE、STOP 等非 G-code 命令。 */
 
 #include "app_config.h"
+#include "app_params.h"
 #include "gcode_stream.h"
 #include "home_controller.h"
 #include "home_sensor.h"
@@ -99,6 +100,7 @@ void Protocol_ProcessLine(const char *line)
 {
     char cmd[APP_SERIAL_LINE_SIZE];
     long a = 0;
+    long b = 0;
 
     if (line == NULL || line[0] == '\0') {
         return;
@@ -124,9 +126,36 @@ void Protocol_ProcessLine(const char *line)
                              (unsigned long)APP_SERIAL_BAUDRATE);
     } else if (strcmp(cmd, "HOSTCAP") == 0) {
         /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
-        SerialDma_Send("OK HOSTCAP role=pulse_executor host_plan=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F ack=seq_cs_line comments=echo_ignored\r\n");
+        const AppParams *p = AppParams_Get();
+        SerialDma_SendFormat("OK HOSTCAP role=pulse_executor host_plan=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
+                             (long)p->pulses_per_rev[0],
+                             (long)p->pulses_per_rev[1]);
     } else if (strcmp(cmd, "STATUS") == 0 || strcmp(cmd, "QSTAT") == 0) {
         Protocol_SendStatus();
+    } else if (strcmp(cmd, "PARAMS") == 0) {
+        const AppParams *p = AppParams_Get();
+        SerialDma_SendFormat("OK PARAMS ppr1=%ld ppr2=%ld base_um=%ld active_um=%ld,%ld passive_um=%ld,%ld\r\n",
+                             (long)p->pulses_per_rev[0],
+                             (long)p->pulses_per_rev[1],
+                             (long)p->scara_base_um,
+                             (long)p->active_arm_um[0],
+                             (long)p->active_arm_um[1],
+                             (long)p->passive_arm_um[0],
+                             (long)p->passive_arm_um[1]);
+    } else if (sscanf(cmd, "PPR %ld %ld", &a, &b) == 2 || sscanf(cmd, "PPR %ld", &a) == 1) {
+        if (b <= 0) {
+            b = a;
+        }
+        if (a < 100 || b < 100 || a > 200000 || b > 200000) {
+            SerialDma_Send("ERR PPR_RANGE\r\n");
+        } else if (Stepper_IsBusy() || GcodeStream_PlannerCount() > 0u) {
+            SerialDma_Send("ERR PPR_BUSY\r\n");
+        } else {
+            AppParams *p = AppParams_Mutable();
+            p->pulses_per_rev[0] = (int32_t)a;
+            p->pulses_per_rev[1] = (int32_t)b;
+            SerialDma_SendFormat("OK PPR ppr1=%ld ppr2=%ld\r\n", a, b);
+        }
     } else if (sscanf(cmd, "HEARTBEAT %ld", &a) == 1) {
         StepperState s;
         Stepper_GetStateSnapshot(&s);

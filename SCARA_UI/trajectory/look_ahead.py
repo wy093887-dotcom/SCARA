@@ -83,9 +83,9 @@ class LookAheadPlanner:
         self,
         accel_mm_s2: float = 100.0,
         junction_deviation: float = 0.02,
-        sample_dt: float = 0.04,
-        max_segment_mm: float = 0.8,
-        min_segment_mm: float = 0.05,
+        sample_dt: float = 0.02,
+        max_segment_mm: float = 0.35,
+        min_segment_mm: float = 0.02,
     ):
         self.accel_mm_s2 = max(1.0, accel_mm_s2)
         self.junction_deviation = max(0.001, junction_deviation)
@@ -107,6 +107,18 @@ class LookAheadPlanner:
             segment = self.line_segment(p0, p1)
             if segment is not None:
                 segments.append(segment)
+        return self.plan_segments(segments, feed_mm_s, start_speed, end_speed, silent_first=silent_first)
+
+    def plan_rounded_polyline(
+        self,
+        points: List[Point2D],
+        feed_mm_s: float,
+        corner_radius_mm: float = 3.0,
+        start_speed: float = 0.0,
+        end_speed: float = 0.0,
+        silent_first: bool = False,
+    ) -> List[PlannerPoint]:
+        segments = self.rounded_polyline_segments(points, corner_radius_mm)
         return self.plan_segments(segments, feed_mm_s, start_speed, end_speed, silent_first=silent_first)
 
     def plan_line(
@@ -213,6 +225,114 @@ class LookAheadPlanner:
             end=end,
             length=abs(delta) * radius,
             center=(cx, cy),
+            radius=radius,
+            start_angle=a0,
+            delta_angle=delta,
+        )
+
+    def rounded_polyline_segments(self, points: List[Point2D], corner_radius_mm: float = 3.0) -> List[GeometrySegment]:
+        clean_points = []
+        for x, y in points:
+            p = (float(x), float(y))
+            if not clean_points or math.hypot(p[0] - clean_points[-1][0], p[1] - clean_points[-1][1]) > 0.001:
+                clean_points.append(p)
+
+        if len(clean_points) < 2:
+            return []
+        if len(clean_points) == 2 or corner_radius_mm <= 0.001:
+            return [segment for segment in (self.line_segment(clean_points[0], clean_points[1]),) if segment is not None]
+
+        segments = []
+        cursor = clean_points[0]
+        radius = max(0.0, float(corner_radius_mm))
+
+        for index in range(1, len(clean_points) - 1):
+            prev_pt = clean_points[index - 1]
+            corner = clean_points[index]
+            next_pt = clean_points[index + 1]
+
+            in_vec = (corner[0] - prev_pt[0], corner[1] - prev_pt[1])
+            out_vec = (next_pt[0] - corner[0], next_pt[1] - corner[1])
+            in_len = math.hypot(in_vec[0], in_vec[1])
+            out_len = math.hypot(out_vec[0], out_vec[1])
+            if in_len <= 0.001 or out_len <= 0.001:
+                continue
+
+            u_in = (in_vec[0] / in_len, in_vec[1] / in_len)
+            u_out = (out_vec[0] / out_len, out_vec[1] / out_len)
+            dot = self._clamp(u_in[0] * u_out[0] + u_in[1] * u_out[1], -0.999999, 0.999999)
+            cross = u_in[0] * u_out[1] - u_in[1] * u_out[0]
+            if abs(cross) < 1e-6 or dot > 0.999:
+                line = self.line_segment(cursor, corner)
+                if line is not None:
+                    segments.append(line)
+                cursor = corner
+                continue
+
+            angle = math.acos(dot)
+            tan_half = math.tan(angle * 0.5)
+            if tan_half <= 1e-6:
+                line = self.line_segment(cursor, corner)
+                if line is not None:
+                    segments.append(line)
+                cursor = corner
+                continue
+
+            offset = min(radius / tan_half, in_len * 0.45, out_len * 0.45)
+            actual_radius = offset * tan_half
+            if offset <= 0.001 or actual_radius <= 0.001:
+                line = self.line_segment(cursor, corner)
+                if line is not None:
+                    segments.append(line)
+                cursor = corner
+                continue
+
+            arc_start = (corner[0] - u_in[0] * offset, corner[1] - u_in[1] * offset)
+            arc_end = (corner[0] + u_out[0] * offset, corner[1] + u_out[1] * offset)
+
+            line = self.line_segment(cursor, arc_start)
+            if line is not None:
+                segments.append(line)
+
+            arc = self._fillet_arc_segment(arc_start, arc_end, u_in, actual_radius, cross)
+            if arc is not None:
+                segments.append(arc)
+                cursor = arc_end
+            else:
+                cursor = corner
+
+        line = self.line_segment(cursor, clean_points[-1])
+        if line is not None:
+            segments.append(line)
+        return segments
+
+    def _fillet_arc_segment(
+        self,
+        start: Point2D,
+        end: Point2D,
+        incoming_unit: Point2D,
+        radius: float,
+        turn_cross: float,
+    ) -> GeometrySegment:
+        if turn_cross > 0.0:
+            normal = (-incoming_unit[1], incoming_unit[0])
+        else:
+            normal = (incoming_unit[1], -incoming_unit[0])
+        center = (start[0] + normal[0] * radius, start[1] + normal[1] * radius)
+        a0 = math.atan2(start[1] - center[1], start[0] - center[0])
+        a1 = math.atan2(end[1] - center[1], end[0] - center[0])
+        if turn_cross > 0.0:
+            delta = (a1 - a0) % (2.0 * math.pi)
+        else:
+            delta = -((a0 - a1) % (2.0 * math.pi))
+        if abs(delta) < 1e-9 or abs(delta) > math.pi * 1.01:
+            return None
+        return GeometrySegment(
+            kind="arc",
+            start=start,
+            end=end,
+            length=abs(delta) * radius,
+            center=center,
             radius=radius,
             start_angle=a0,
             delta_angle=delta,

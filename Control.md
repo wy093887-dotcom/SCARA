@@ -56,8 +56,8 @@ ERRORS           展开底层错误 bit。
 HOME_SENSOR      查看 HOME1/HOME2 输入。
 ENABLE 1         使能双轴输出。
 ENABLE 0         关闭双轴输出。
-STOP             受控停止。
-ESTOP            急停。
+STOP             受控停止；主 UI“停止”会清除上位机待发送队列。
+ESTOP            急停；主 UI“急停”会保留上位机待发送队列。
 CLEAR_ERROR      清除错误位。
 ZERO             软件清零。
 WATCHDOG OFF     关闭通信看门狗。

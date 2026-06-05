@@ -1,9 +1,8 @@
-# E:\v1\SCARA-main\SCARA_UI\motor_monitor\test_monitor.py
-import time
 import re
-import numpy as np
-from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton
+import time
+
 from PySide6.QtCore import Slot
+from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
 try:
     import pyqtgraph as pg
@@ -12,30 +11,28 @@ except ImportError:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
 
+
+_FEEDBACK_RE = re.compile(r"X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)")
+
+
 class MonitorWindow(QMainWindow):
     def __init__(self, kinematics_engine):
         super().__init__()
-        self.setWindowTitle("电机动力学实时监控 (已开启平滑滤波)")
+        self.setWindowTitle("\u7535\u673a\u52a8\u529b\u5b66\u5b9e\u65f6\u76d1\u63a7 (\u771f\u5b9e\u53cd\u9988\u89e3\u7b97)")
         self.resize(1000, 800)
-        
+
         self.kin = kinematics_engine
         self.is_running = True
-        
-        # 数据缓存
+        self.window_seconds = 10.0
+
         self.time_history = []
         self.v1_data, self.v2_data = [], []
         self.a1_data, self.a2_data = [], []
-        
-        # 滤波状态变量 (指数移动平均滤波)
-        self.alpha_v = 0.2  # 速度平滑系数 (0-1, 越小越平滑)
-        self.alpha_a = 0.1  # 加速度平滑系数
-        self.last_v_filt = [0.0, 0.0]
-        self.last_a_filt = [0.0, 0.0]
-        
-        # 运动学记录
-        self.last_pos = None # (x, y) 用于检测重复数据
-        self.last_theta = None # (t1, t2)
-        self.last_time = time.perf_counter()
+
+        self.last_pos = None
+        self.last_theta = None
+        self.last_velocity = None
+        self.last_time = None
         self.start_timestamp = time.perf_counter()
 
         self.init_ui()
@@ -46,27 +43,30 @@ class MonitorWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
 
         btn_layout = QHBoxLayout()
-        self.btn_pause = QPushButton("开始/暂停显示")
-        self.btn_clear = QPushButton("清空图像")
-        btn_layout.addWidget(self.btn_pause); btn_layout.addWidget(self.btn_clear)
+        self.btn_pause = QPushButton("\u5f00\u59cb/\u6682\u505c\u663e\u793a")
+        self.btn_clear = QPushButton("\u6e05\u7a7a\u56fe\u50cf")
+        btn_layout.addWidget(self.btn_pause)
+        btn_layout.addWidget(self.btn_clear)
         layout.addLayout(btn_layout)
 
         if pg is not None:
             self.view = pg.GraphicsLayoutWidget()
             layout.addWidget(self.view)
 
-            p1_pen = pg.mkPen(color='#00FF00', width=2)
-            p2_pen = pg.mkPen(color='#00FFFF', width=2)
+            p1_pen = pg.mkPen(color="#00FF00", width=2)
+            p2_pen = pg.mkPen(color="#00FFFF", width=2)
 
-            self.p_v1 = self.view.addPlot(title="电机 1 速度 (deg/s)")
+            self.p_v1 = self.view.addPlot(title="\u7535\u673a 1 \u771f\u5b9e\u53cd\u9988\u901f\u5ea6 (deg/s)")
             self.cv1 = self.p_v1.plot(pen=p1_pen)
-            self.p_v2 = self.view.addPlot(title="电机 2 速度 (deg/s)")
+            self.p_v2 = self.view.addPlot(title="\u7535\u673a 2 \u771f\u5b9e\u53cd\u9988\u901f\u5ea6 (deg/s)")
             self.cv2 = self.p_v2.plot(pen=p2_pen)
             self.view.nextRow()
-            self.p_a1 = self.view.addPlot(title="电机 1 加速度 (deg/s²)")
+            self.p_a1 = self.view.addPlot(title="\u7535\u673a 1 \u771f\u5b9e\u53cd\u9988\u52a0\u901f\u5ea6 (deg/s\u00b2)")
             self.ca1 = self.p_a1.plot(pen=p1_pen)
-            self.p_a2 = self.view.addPlot(title="电机 2 加速度 (deg/s²)")
+            self.p_a2 = self.view.addPlot(title="\u7535\u673a 2 \u771f\u5b9e\u53cd\u9988\u52a0\u901f\u5ea6 (deg/s\u00b2)")
             self.ca2 = self.p_a2.plot(pen=p2_pen)
+            for plot in (self.p_v1, self.p_v2, self.p_a1, self.p_a2):
+                plot.showGrid(x=True, y=True, alpha=0.2)
         else:
             self.fig = Figure(figsize=(8, 6))
             self.canvas = FigureCanvas(self.fig)
@@ -75,102 +75,110 @@ class MonitorWindow(QMainWindow):
             self.ax_v2 = self.fig.add_subplot(222)
             self.ax_a1 = self.fig.add_subplot(223)
             self.ax_a2 = self.fig.add_subplot(224)
-            self.cv1, = self.ax_v1.plot([], [], color='#00AA00', lw=1.2)
-            self.cv2, = self.ax_v2.plot([], [], color='#0088AA', lw=1.2)
-            self.ca1, = self.ax_a1.plot([], [], color='#00AA00', lw=1.2)
-            self.ca2, = self.ax_a2.plot([], [], color='#0088AA', lw=1.2)
+            self.cv1, = self.ax_v1.plot([], [], color="#00AA00", lw=1.2)
+            self.cv2, = self.ax_v2.plot([], [], color="#0088AA", lw=1.2)
+            self.ca1, = self.ax_a1.plot([], [], color="#00AA00", lw=1.2)
+            self.ca2, = self.ax_a2.plot([], [], color="#0088AA", lw=1.2)
             for ax, title in (
-                (self.ax_v1, "电机 1 速度 (deg/s)"),
-                (self.ax_v2, "电机 2 速度 (deg/s)"),
-                (self.ax_a1, "电机 1 加速度 (deg/s²)"),
-                (self.ax_a2, "电机 2 加速度 (deg/s²)"),
+                (self.ax_v1, "\u7535\u673a 1 \u771f\u5b9e\u53cd\u9988\u901f\u5ea6 (deg/s)"),
+                (self.ax_v2, "\u7535\u673a 2 \u771f\u5b9e\u53cd\u9988\u901f\u5ea6 (deg/s)"),
+                (self.ax_a1, "\u7535\u673a 1 \u771f\u5b9e\u53cd\u9988\u52a0\u901f\u5ea6 (deg/s\u00b2)"),
+                (self.ax_a2, "\u7535\u673a 2 \u771f\u5b9e\u53cd\u9988\u52a0\u901f\u5ea6 (deg/s\u00b2)"),
             ):
                 ax.set_title(title)
                 ax.grid(True, alpha=0.2)
 
-        self.btn_pause.clicked.connect(lambda: setattr(self, 'is_running', not self.is_running))
+        self.btn_pause.clicked.connect(lambda: setattr(self, "is_running", not self.is_running))
         self.btn_clear.clicked.connect(self.clear_all)
 
     def clear_all(self):
         self.time_history.clear()
-        self.v1_data.clear(); self.v2_data.clear()
-        self.a1_data.clear(); self.a2_data.clear()
-        self._set_curve_data(self.cv1, [], [])
-        self._set_curve_data(self.cv2, [], [])
-        self._set_curve_data(self.ca1, [], [])
-        self._set_curve_data(self.ca2, [], [])
-        if pg is None:
-            self.canvas.draw_idle()
+        self.v1_data.clear()
+        self.v2_data.clear()
+        self.a1_data.clear()
+        self.a2_data.clear()
+        self.last_pos = None
+        self.last_theta = None
+        self.last_velocity = None
+        self.last_time = None
+        self.start_timestamp = time.perf_counter()
+        self.update_plots()
 
     @Slot(str)
     def process_new_data(self, raw_str):
-        if not self.is_running: return
-        try:
-            x_m = re.search(r"X([-+]?\d*\.\d+|\d+)", raw_str)
-            y_m = re.search(r"Y([-+]?\d*\.\d+|\d+)", raw_str)
-            
-            if x_m and y_m:
-                curr_x, curr_y = float(x_m.group(1)), float(y_m.group(1))
-                
-                # --- 核心修复 1: 重复数据拦截 ---
-                # 如果坐标和上一次完全一样，说明是重复解析同一行，直接拦截，防止速度跌落至0
-                if self.last_pos == (curr_x, curr_y):
-                    return
-                
-                # 逆解
-                res = self.kin.inverse(curr_x, curr_y)
-                if res[0] is None: return
-                t1, t2 = res[0], res[1]
+        if not self.is_running:
+            return
 
-                now = time.perf_counter()
-                dt = now - self.last_time
-                # 限制 dt 防止抖动 (最小 20ms)
-                if dt < 0.02: return 
-                
-                if self.last_theta is not None:
-                    # 1. 计算原始速度
-                    raw_v1 = (t1 - self.last_theta[0]) / dt
-                    raw_v2 = (t2 - self.last_theta[1]) / dt
-                    
-                    # --- 核心修复 2: 速度低通滤波 ---
-                    v1_f = self.alpha_v * raw_v1 + (1 - self.alpha_v) * self.last_v_filt[0]
-                    v2_f = self.alpha_v * raw_v2 + (1 - self.alpha_v) * self.last_v_filt[1]
-                    
-                    # 2. 计算原始加速度
-                    raw_a1 = (v1_f - self.last_v_filt[0]) / dt
-                    raw_a2 = (v2_f - self.last_v_filt[1]) / dt
-                    
-                    # --- 核心修复 3: 加速度低通滤波 ---
-                    a1_f = self.alpha_a * raw_a1 + (1 - self.alpha_a) * self.last_a_filt[0]
-                    a2_f = self.alpha_a * raw_a2 + (1 - self.alpha_a) * self.last_a_filt[1]
-                    
-                    # 存储平滑后的数据
-                    self.time_history.append(now - self.start_timestamp)
-                    self.v1_data.append(v1_f); self.v2_data.append(v2_f)
-                    self.a1_data.append(a1_f); self.a2_data.append(a2_f)
-                    
-                    # 更新状态
-                    self.last_v_filt = [v1_f, v2_f]
-                    self.last_a_filt = [a1_f, a2_f]
-                    
-                    if len(self.time_history) > 500:
-                        for arr in [self.time_history, self.v1_data, self.v2_data, self.a1_data, self.a2_data]: arr.pop(0)
-                    self.update_plots()
+        match = _FEEDBACK_RE.search(raw_str)
+        if not match:
+            return
 
-                self.last_pos = (curr_x, curr_y)
-                self.last_theta = (t1, t2)
-                self.last_time = now
-        except: pass
+        curr_x, curr_y = float(match.group(1)), float(match.group(2))
+        if self.last_pos == (curr_x, curr_y):
+            return
+
+        theta = self.kin.inverse(curr_x, curr_y)
+        if theta[0] is None:
+            return
+
+        now = time.perf_counter()
+        if self.last_theta is not None and self.last_time is not None:
+            dt = now - self.last_time
+            if dt <= 0.0:
+                return
+
+            v1 = (theta[0] - self.last_theta[0]) / dt
+            v2 = (theta[1] - self.last_theta[1]) / dt
+
+            if self.last_velocity is not None:
+                a1 = (v1 - self.last_velocity[0]) / dt
+                a2 = (v2 - self.last_velocity[1]) / dt
+                t_rel = now - self.start_timestamp
+                self.time_history.append(t_rel)
+                self.v1_data.append(v1)
+                self.v2_data.append(v2)
+                self.a1_data.append(a1)
+                self.a2_data.append(a2)
+                self._trim_window(t_rel)
+                self.update_plots()
+
+            self.last_velocity = (v1, v2)
+
+        self.last_pos = (curr_x, curr_y)
+        self.last_theta = (theta[0], theta[1])
+        self.last_time = now
+
+    def _trim_window(self, latest_time):
+        min_time = max(0.0, latest_time - self.window_seconds)
+        while self.time_history and self.time_history[0] < min_time:
+            self.time_history.pop(0)
+            self.v1_data.pop(0)
+            self.v2_data.pop(0)
+            self.a1_data.pop(0)
+            self.a2_data.pop(0)
 
     def update_plots(self):
         self._set_curve_data(self.cv1, self.time_history, self.v1_data)
         self._set_curve_data(self.cv2, self.time_history, self.v2_data)
         self._set_curve_data(self.ca1, self.time_history, self.a1_data)
         self._set_curve_data(self.ca2, self.time_history, self.a2_data)
-        if pg is None:
+        self._apply_time_window()
+
+    def _apply_time_window(self):
+        latest = self.time_history[-1] if self.time_history else 0.0
+        if latest <= self.window_seconds:
+            start, end = 0.0, self.window_seconds
+        else:
+            start, end = latest - self.window_seconds, latest
+
+        if pg is not None:
+            for plot in (self.p_v1, self.p_v2, self.p_a1, self.p_a2):
+                plot.setXRange(start, end, padding=0)
+        else:
             for ax in (self.ax_v1, self.ax_v2, self.ax_a1, self.ax_a2):
+                ax.set_xlim(start, end)
                 ax.relim()
-                ax.autoscale_view()
+                ax.autoscale_view(scalex=False, scaley=True)
             self.canvas.draw_idle()
 
     def _set_curve_data(self, curve, x_data, y_data):

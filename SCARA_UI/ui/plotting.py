@@ -8,7 +8,6 @@ class ScaraPlotMixin:
         self.feedback_x, self.feedback_y = [], []
         self.preview_x, self.preview_y = [], []
         self.preview_label = ""
-        self._plot_user_view = False
         self.update_plot()
 
     def log_error(self, m):
@@ -27,7 +26,6 @@ class ScaraPlotMixin:
         self.preview_x = [float(p[0]) for p in path]
         self.preview_y = [float(p[1]) for p in path]
         self.preview_label = label
-        self._plot_user_view = False
         self.update_plot()
 
     def append_feedback_point(self, x, y):
@@ -55,6 +53,7 @@ class ScaraPlotMixin:
         if getattr(self, "_plot_ready", False):
             return
         self.setup_plot_interaction()
+        self.fig.subplots_adjust(left=0.055, right=0.995, bottom=0.075, top=0.995)
         self.ax.clear()
         self.ws_artist = self.ax.scatter(self.ws_x, self.ws_y, s=1, color="#e5f2ff", label="workspace")
         (self.preview_line,) = self.ax.plot([], [], color="#2ca02c", lw=1.2, label="规划预览")
@@ -68,8 +67,8 @@ class ScaraPlotMixin:
         self.ax.tick_params(axis="x", labelrotation=90, labelsize=7)
         self.ax.tick_params(axis="y", labelsize=7)
         self.ax.grid(True, alpha=0.15)
-        self.ax.set_aspect("equal", adjustable="box")
-        self.ax.legend(loc="upper right", fontsize=7)
+        self.ax.margins(0)
+        self.ax.set_aspect("equal", adjustable="datalim")
         self._plot_ready = True
 
     def update_plot(self, q1_deg=None, q2_deg=None):
@@ -94,8 +93,9 @@ class ScaraPlotMixin:
         self.left_arm_line.set_data([0, c1[0], self.cur_x], [0, c1[1], self.cur_y])
         self.right_arm_line.set_data([self.L0, c2[0], self.cur_x], [0, c2[1], self.cur_y])
         self.current_point_line.set_data([self.cur_x], [self.cur_y])
-        if not getattr(self, "_plot_user_view", False):
+        if not getattr(self, "_plot_view_initialized", False):
             self._fit_motion_axis()
+            self._plot_view_initialized = True
 
         self.status_label.setText(f"坐标: X={self.cur_x:.1f}, Y={self.cur_y:.1f}")
         self.canvas.draw_idle()

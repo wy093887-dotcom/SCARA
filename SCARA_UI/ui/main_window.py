@@ -36,7 +36,7 @@ class FiveBarSerialGUI(
 
         self.accel = 100.0
         self.junction_dev = 0.02
-        self.dt = 0.04
+        self.dt = 0.02
 
         self.kinematics = FiveBarKinematics(
             FiveBarConfig(
@@ -49,6 +49,8 @@ class FiveBarSerialGUI(
             accel_mm_s2=self.accel,
             junction_deviation=self.junction_dev,
             sample_dt=self.dt,
+            max_segment_mm=0.35,
+            min_segment_mm=0.02,
         )
 
         self.cam_proc = CameraProcessor()
@@ -67,6 +69,8 @@ class FiveBarSerialGUI(
         self.teach_data = []
         self.teach_points = []
         self.point_queue = []
+        self.current_ppr = 1600
+        self.microstep_dirty = True
 
         self.waiting_for_ack = False
         self.last_sent_package = ""
