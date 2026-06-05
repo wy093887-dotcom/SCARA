@@ -27,7 +27,7 @@ class FiveBarSerialGUI(
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SCARA Serial Control System")
-        self.resize(1300, 850)
+        self.resize(1400, 950)
 
         self.ser = None
         self.L0, self.L1, self.L2 = 150.0, 160.0, 200.0

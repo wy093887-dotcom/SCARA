@@ -104,6 +104,45 @@ class MonitorWindow(QMainWindow):
         self.start_timestamp = time.perf_counter()
         self.update_plots()
 
+    def process_tcp_point(self, x, y, dt):
+        """??/???????????? dt ?? TCP ???????????
+
+        ? process_new_data??????????????
+        ???????????? dt??? ? ??????????
+        ?????????????????????
+        """
+        if not self.is_running:
+            return
+
+        curr_x, curr_y = x, y
+        if self.last_pos == (curr_x, curr_y):
+            return
+
+        theta = self.kin.inverse(curr_x, curr_y)
+        if theta[0] is None:
+            return
+
+        if self.last_theta is not None and dt > 1e-9:
+            v1 = (theta[0] - self.last_theta[0]) / dt
+            v2 = (theta[1] - self.last_theta[1]) / dt
+
+            if self.last_velocity is not None:
+                a1 = (v1 - self.last_velocity[0]) / dt
+                a2 = (v2 - self.last_velocity[1]) / dt
+                t_rel = self.time_history[-1] + dt if self.time_history else 0.0
+                self.time_history.append(t_rel)
+                self.v1_data.append(v1)
+                self.v2_data.append(v2)
+                self.a1_data.append(a1)
+                self.a2_data.append(a2)
+                self._trim_window(t_rel)
+                self.update_plots()
+
+            self.last_velocity = (v1, v2)
+
+        self.last_pos = (curr_x, curr_y)
+        self.last_theta = (theta[0], theta[1])
+
     @Slot(str)
     def process_new_data(self, raw_str):
         if not self.is_running:
