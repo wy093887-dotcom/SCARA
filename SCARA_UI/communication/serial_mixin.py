@@ -312,4 +312,27 @@ class ScaraSerialMixin:
             self.waiting_for_ack = True  
             self.timeout_timer.start(1000) 
         else:
+            # ---- ??????????? / ???????? dt ----
+            prev_x, prev_y = self.cur_x, self.cur_y
+            self.cur_x, self.cur_y = tx, ty
+            if slt:
+                self.history_x, self.history_y = [tx], [ty]
+            else:
+                self.history_x.append(tx)
+                self.history_y.append(ty)
+
+            import math as _math
+            dx = tx - prev_x
+            dy = ty - prev_y
+            dist = _math.hypot(dx, dy)
+            feed_mm_s = feed_rate / 60.0
+            dt = dist / feed_mm_s if feed_mm_s > 0.001 else self.dt
+
+            monitor = getattr(self, "velocity_monitor", None)
+            if monitor is not None and hasattr(monitor, "process_tcp_point"):
+                monitor.process_tcp_point(tx, ty, dt)
+
+            ik = self.inverse_kinematics(tx, ty)
+            if ik and ik[0] is not None:
+                self.update_plot(ik[0], ik[1])
             QTimer.singleShot(10, self.process_queue)

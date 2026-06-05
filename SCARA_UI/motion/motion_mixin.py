@@ -684,20 +684,23 @@ class ScaraMotionMixin:
     
     def motor_jog(self, motor_id, direction):
         """
-        单独控制电机轴实现正向/逆向旋转5°
-        :param motor_id: 电机编号 (1 或 2)
-        :param direction: 方向 (1: 正向, -1: 逆向)
+        ???????????/????????????
+        :param motor_id: ???? (1 ? 2)
+        :param direction: ?? (1: ??, -1: ??)
         """
         try:
-            # 获取当前角度
-            current_angles = self.inverse_kinematics(self.cur_x, self.cur_y)
+            # ???????????????????????
+            if self.waiting_for_ack or self.point_queue:
+                sx, sy = self.point_queue[-1][0], self.point_queue[-1][1]
+            else:
+                sx, sy = self.cur_x, self.cur_y
+            current_angles = self.inverse_kinematics(sx, sy)
             if current_angles[0] is None or current_angles[1] is None:
                 self.log_error("无法获取当前关节角度")
                 return
             
             q1, q2 = current_angles
             
-            # 单次旋转角度 = 3度
             half_turn = 3.0
             new_q1, new_q2 = q1, q2
             
@@ -706,32 +709,53 @@ class ScaraMotionMixin:
             elif motor_id == 2:
                 new_q2 = q2 + direction * half_turn
             else:
-                self.log_error(f"无效电机编号: {motor_id}")
+                self.log_error(f"??????: {motor_id}")
                 return
             
-            # 使用正向运动学计算新的末端位置
             new_x, new_y = self.kinematics.forward(new_q1, new_q2)
             if new_x is None or new_y is None:
-                self.log_error(f"电机{motor_id}旋转半圈后位置不可达")
+                self.log_error(f"??{motor_id}????????")
                 return
 
-            # 检查新位置是否安全
             if not self.check_workspace_safety(new_x, new_y):
-                self.log_error(f"电机{motor_id}旋转后超出工作空间: X={new_x:.1f}, Y={new_y:.1f}")
+                self.log_error(f"??{motor_id}?????????: X={new_x:.1f}, Y={new_y:.1f}")
                 return
 
             v_max = float(self.jog_speed_input.text())
-            path = self.generate_linear_path(self.cur_x, self.cur_y, new_x, new_y, v_max, v_start=0.0, v_end=0.0)
+            num_steps = 20  # ??????????
+
+            # ---- ???????????????????? ----
+            joint_points = []
+            for i in range(num_steps + 1):
+                t = i / num_steps
+                if motor_id == 1:
+                    jq1 = q1 + t * direction * half_turn
+                    jq2 = q2
+                else:
+                    jq1 = q1
+                    jq2 = q2 + t * direction * half_turn
+                px, py = self.kinematics.forward(jq1, jq2)
+                if px is None or py is None:
+                    self.log_error(f"??{motor_id}???{i}???")
+                    return
+                joint_points.append((px, py))
+
+            # ---- ?????TCP ????? ----
+            path = []
+            for i in range(1, len(joint_points)):
+                x0, y0 = joint_points[i - 1]
+                x1, y1 = joint_points[i]
+                path.append((x1, y1, v_max, False))
 
             if not path:
-                self.log_error("电机点动距离过短，未生成轨迹")
+                self.log_error("??????????????")
                 return
 
-            self.preview_planned_path(path, f"电机{motor_id}点动")
+            self.preview_planned_path(path, f"??{motor_id}??")
             self.load_motion_queue(path, append=True)
             self.log_display.append(
-                f"<font color='cyan'>电机{motor_id} {direction > 0 and '正向' or '逆向'}旋转半圈: ({self.cur_x:.1f},{self.cur_y:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
+                f"<font color='cyan'>??{motor_id} {'??' if direction > 0 else '??'}????????: ({sx:.1f},{sy:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
             )
 
         except Exception as e:
-            self.log_error(f"电机控制错误: {e}")
+            self.log_error(f"??????: {e}")

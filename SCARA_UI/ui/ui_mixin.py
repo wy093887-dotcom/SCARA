@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QSizePolicy,
     QSlider,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -140,6 +141,7 @@ class ScaraUiMixin:
         # 3. 方向点动
         jog_group = QGroupBox("方向点动")
         jog_grid = QGridLayout()
+        jog_grid.setSpacing(6)  # ?????
         self.btns = {"UP": QPushButton("前进"), "DOWN": QPushButton("后退"), "LEFT": QPushButton("左移"), "RIGHT": QPushButton("右移")}
         for b in self.btns.values(): 
             b.setFixedSize(100, 30)
@@ -265,9 +267,16 @@ class ScaraUiMixin:
         self.btn_hand_run.clicked.connect(self.plan_handwriting_path)
         left_panel.addStretch()
 
-        # --- 中间面板 (3/10) ---
-        mid_panel = QVBoxLayout()
-        main_layout.addLayout(mid_panel, 3)
+        # --- ???? (3/10) --- ?? QScrollArea ???????????
+        mid_scroll = QScrollArea()
+        mid_scroll.setWidgetResizable(True)
+        mid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        mid_scroll.setStyleSheet("QScrollArea { border: none; }")
+        mid_widget = QWidget()
+        mid_panel = QVBoxLayout(mid_widget)
+        mid_panel.setSpacing(6)
+        mid_scroll.setWidget(mid_widget)
+        main_layout.addWidget(mid_scroll, 3)
         
         coord_group = QGroupBox("实时坐标")
         c_lay = QVBoxLayout()
