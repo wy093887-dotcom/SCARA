@@ -3,6 +3,7 @@
 /* G-code 流接收层：解析上位机已经规划好的 G0/G1 X/Y/F，并返回 ok seq/cs/line 回显。 */
 
 #include "app_config.h"
+#include "binary_traj.h"
 #include "home_controller.h"
 #include "home_sensor.h"
 #include "motion_planner.h"
@@ -509,7 +510,7 @@ static void send_status(void)
     (void)current_xy_from_stepper(&x, &y);
     const char *mode = Stepper_IsBusy() || s_count > 0 ? "Run" : "Idle";
     uint32_t err = state.axis[0].error | state.axis[1].error;
-    SerialDma_SendFormat("<%s|M:%ld.%03ld,%ld.%03ld|P:%ld,%ld|Bf:%u,%u|Q:%u|E:%lu|H:%u,%u|HS:%s|A1:%u,%u,%ld,%ld|A2:%u,%u,%ld,%ld>\n",
+    SerialDma_SendFormat("<%s|M:%ld.%03ld,%ld.%03ld|P:%ld,%ld|Bf:%u,%u|Q:%u|JT:%s,%lu,%lu,%u,%u|JU:%lu,%lu,%u|E:%lu|H:%u,%u|HS:%s|Hz:%lu|A1:%u,%u,%ld,%ld|A2:%u,%u,%ld,%ld>\n",
                          mode,
                          (long)(x / 1000), (long)i32_abs(x % 1000),
                          (long)(y / 1000), (long)i32_abs(y % 1000),
@@ -518,10 +519,19 @@ static void send_status(void)
                          (unsigned int)GcodeStream_PlannerFree(),
                          (unsigned int)SerialDma_RxFreeCount(),
                          (unsigned int)GcodeStream_PlannerCount(),
+                         BinaryTraj_StateName(BinaryTraj_GetState()),
+                         (unsigned long)BinaryTraj_AcceptedCount(),
+                         (unsigned long)BinaryTraj_ExecutedCount(),
+                         (unsigned int)BinaryTraj_BufferCount(),
+                         (unsigned int)BinaryTraj_BufferFree(),
+                         (unsigned long)BinaryTraj_StreamUnderrunTicks(),
+                         (unsigned long)BinaryTraj_MaxDispatchGapTicks(),
+                         (unsigned int)BinaryTraj_MinBufferCount(),
                          (unsigned long)err,
                          home.home1_active ? 1u : 0u,
                          home.home2_active ? 1u : 0u,
                          HomeController_StateName(HomeController_GetState()),
+                         (unsigned long)APP_CONTROL_HZ,
                          state.axis[0].enabled ? 1u : 0u,
                          state.axis[0].running ? 1u : 0u,
                          (long)state.axis[0].current_pps,

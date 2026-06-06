@@ -240,7 +240,12 @@ class LookAheadPlanner:
         if len(clean_points) < 2:
             return []
         if len(clean_points) == 2 or corner_radius_mm <= 0.001:
-            return [segment for segment in (self.line_segment(clean_points[0], clean_points[1]),) if segment is not None]
+            segments = []
+            for start, end in zip(clean_points, clean_points[1:]):
+                line = self.line_segment(start, end)
+                if line is not None:
+                    segments.append(line)
+            return segments
 
         segments = []
         cursor = clean_points[0]
@@ -278,8 +283,8 @@ class LookAheadPlanner:
                 cursor = corner
                 continue
 
-            offset = min(radius / tan_half, in_len * 0.45, out_len * 0.45)
-            actual_radius = offset * tan_half
+            offset = min(radius * tan_half, in_len * 0.45, out_len * 0.45)
+            actual_radius = offset / tan_half
             if offset <= 0.001 or actual_radius <= 0.001:
                 line = self.line_segment(cursor, corner)
                 if line is not None:

@@ -1,33 +1,34 @@
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
-/* Central firmware tuning parameters.
- * Adjust mechanism, motion, homing, serial, and flash defaults here.
+/* 固件集中调参文件。
+ * 机械尺寸、10kHz 控制周期、速度/加速度、串口缓冲、回零和 Flash 参数都优先在这里调整。
+ * 修改后必须重新编译并重新烧录；同时确认 UI 里的 PPR、零点和机构尺寸保持一致。
  */
 
 #include <stdint.h>
 
 /* Firmware identity shown by VERSION. */
 #define APP_FW_NAME "SCARA_F103"
-#define APP_FW_VERSION "0.24.1"
+#define APP_FW_VERSION "0.25.0"
 
 /* Current controller drives two stepper axes. */
 #define APP_AXIS_COUNT 2u
 
-/* Base timer clock for PWM pulse generation. */
+/* PWM 脉冲定时器基准频率，当前 1MHz 表示 1us 计数精度。 */
 #define APP_STEPPER_TIMER_HZ 1000000u
-/* Main control loop frequency used by the software stepper model. */
-#define APP_CONTROL_HZ 1000u
+/* 实时插补/速度更新频率。10000Hz 表示每 100us 执行一次运动内核。 */
+#define APP_CONTROL_HZ 10000u
 
-/* Lowest useful pulse rate. Lower than this is treated as stopped. */
+/* 最低有效 PPS，低于该值按停止处理，防止很慢的抖动脉冲。 */
 #define APP_MIN_EFFECTIVE_PPS 16
-/* Default per-axis speed limit used by normal motion planning. */
+/* 默认单轴速度上限。若 UI 默认 PPR 从 1600 提到 3200，同样 mm/s 会需要更高 PPS。 */
 #define APP_MAX_PPS_DEFAULT 10000
-/* Absolute hard ceiling for per-axis pulse speed. */
+/* 单轴 PPS 硬上限，只用于保护，实际运行应留足余量。 */
 #define APP_MAX_PPS_HARD 50000
-/* Default acceleration in pulses/s^2 for both axes. */
-#define APP_ACCEL_DEFAULT 3000
-/* Maximum allowed acceleration in pulses/s^2. */
+/* 默认加速度，单位 pulses/s^2；调大响应快但更容易振动/丢步。 */
+#define APP_ACCEL_DEFAULT 30000
+/* 加速度上限，防止上位机或命令传入过激参数。 */
 #define APP_ACCEL_MAX 50000
 
 /* Software pulse position range. Only used when MCU-side limits are enabled. */
@@ -38,8 +39,8 @@
  */
 #define APP_HOST_OWNS_LIMIT_CHECKS 1u
 
-/* Motor and transmission parameters used by pulse-angle conversion. */
-/* Pulses per motor revolution after driver microstep configuration. */
+/* 电机和传动参数，用于脉冲与关节角换算；必须和上位机、驱动器拨码一致。 */
+/* 驱动器细分后的每圈脉冲数。若 UI 使用 3200，这里或运行时 PPR 命令也应同步为 3200。 */
 #define APP_PULSES_PER_REV_M1 1600L
 #define APP_PULSES_PER_REV_M2 1600L
 /* Gear reduction ratio from motor shaft to active arm. */
@@ -121,6 +122,17 @@
 #define APP_GCODE_RAPID_PPS APP_MAX_PPS_DEFAULT
 /* Legacy linear segmentation length in micrometers. */
 #define APP_GCODE_LINEAR_SEGMENT_UM 2000L
+
+/* 二进制关节轨迹协议参数。
+ * APP_BINARY_TRAJ_POINTS：MCU 轨迹环形缓冲容量，太小容易欠载，太大会占 RAM。
+ * APP_BINARY_TRAJ_MIN_PREFILL：启动前最少预填关键点，太小会启动后断流，太大点击等待更久。
+ * APP_BINARY_TRAJ_START_DELAY_MS：RUN 后延时启动，给上位机继续补点留时间。
+ */
+#define APP_BINARY_TRAJ_VERSION 1u
+#define APP_BINARY_TRAJ_MAX_PAYLOAD 244u
+#define APP_BINARY_TRAJ_POINTS 128u
+#define APP_BINARY_TRAJ_MIN_PREFILL 4u
+#define APP_BINARY_TRAJ_START_DELAY_MS 20u
 
 /* MOVL segmentation length in micrometers. */
 #define APP_MOVL_SEGMENT_UM 2000L

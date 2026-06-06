@@ -3,6 +3,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMainWindow
 
 from ..communication.serial_mixin import ScaraSerialMixin
+from ..core.feedback_error import FeedbackErrorTracker
 from ..core.kinematics import FiveBarConfig, FiveBarKinematics
 from ..core.utility_mixin import ScaraUtilityMixin
 from ..motion.motion_mixin import ScaraMotionMixin
@@ -27,7 +28,7 @@ class FiveBarSerialGUI(
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SCARA Serial Control System")
-        self.resize(1400, 950)
+        self.resize(1220, 820)
 
         self.ser = None
         self.L0, self.L1, self.L2 = 150.0, 160.0, 200.0
@@ -62,6 +63,9 @@ class FiveBarSerialGUI(
         self.feedback_x, self.feedback_y = [], []
         self.preview_x, self.preview_y = [], []
         self.preview_label = ""
+        self.feedback_error_tracker = FeedbackErrorTracker()
+        self.latest_feedback_error = None
+        self.feedback_error_stats = None
         self._plot_user_view = False
         self.velocity_monitor = None
         self.is_silent_move = False
@@ -69,7 +73,7 @@ class FiveBarSerialGUI(
         self.teach_data = []
         self.teach_points = []
         self.point_queue = []
-        self.current_ppr = 1600
+        self.current_ppr = 3200
         self.microstep_dirty = True
 
         self.waiting_for_ack = False
@@ -85,6 +89,11 @@ class FiveBarSerialGUI(
         self.mcu_planner_free = 32
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
+        self.binary_seq = 1
+        self.emergency_paused = False
+        self.emergency_resume_path = []
+        self.active_binary_send_path = []
+        self.active_preview_path = []
 
         self.board_only_debug = True
         self.is_homed = self.board_only_debug

@@ -396,6 +396,72 @@ MATCH ...
 -QuietLines
 ```
 
+### 10 kHz 反馈误差压测与分析
+
+烧录 `0.25.0` 固件后，先用 ASCII 回退路径确认状态帧、反馈坐标和误差统计链路：
+
+```powershell
+cd C:\Users\22602\Desktop\SCARA\SCARA_F103
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\feedback_error_stress.ps1 -Port COM13 -Count 1000 -FeedMmMin 900 -MaxErrorMm 1.0 -CsvPath .\logs\feedback_ascii.csv -EnableMotion
+```
+
+改动二进制插补或速度连续性策略前，先跑离线段级仿真：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\simulate_binary_interpolator.ps1 -Count 3000 -FeedPps 600
+```
+
+当前二进制轨迹段派发由 `BinaryTraj_Tick10kHz()` 在 100 us 控制周期内推进；主循环只负责串口解析、协议响应和低频任务，避免段切换受主循环调度抖动影响。
+
+UI 正式运行 `G1/G2/G3` 时，预览轨迹和实际下发轨迹分离：
+
+```text
+G1 直线：界面仍按细采样显示预览；实际下发路径按关节空间插补后的 XY 偏差自适应生成关键点，默认目标是整条反馈轨迹误差不超过 1 mm。
+G2/G3 圆弧：界面保留细采样预览，实际按约 2 mm 弦长生成圆弧关键点；MCU 按下一段速度计算 exit_pps，避免段间速度固定掉到半速。
+ASCII G-code 点流保留为二进制上传失败或调试时的回退路径。
+```
+
+模拟 UI 的 `G1 直线` 按钮下发二进制关键点，并按整条 XY 直线统计反馈误差：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_binary_line_stress.ps1 -Port COM13 -StartX 75 -StartY 220 -EndX 150 -EndY 250 -FeedMmS 20 -MaxErrorMm 1.0 -CsvPath .\logs\ui_binary_line_latest.csv
+```
+
+再用二进制关节空间插补路径压测下位机 10 kHz 运动内核：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\binary_joint_traj_stress.ps1 -Port COM13 -Count 3000 -ChunkPoints 20 -FeedPps 600 -MaxErrorMm 1.0 -CsvPath .\logs\feedback_binary.csv -EnableMotion
+```
+
+离线分析 CSV，直接输出轴向峰值、轴向 RMS、范数峰值、范数 RMS 和最差样本位置：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\analyze_feedback_error_csv.ps1 -CsvPath .\logs\feedback_binary.csv -MaxErrorMm 1.0 -MaxRmsMm 0.5 -WorstCount 10
+```
+
+批量扫 `FeedPps / ChunkPoints` 参数组合，自动保存每组 CSV、分析结果和总汇总：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\sweep_binary_feedback_error.ps1 -Port COM13 -Count 3000 -FeedPpsList 300,600,900 -ChunkPointsList 10,20,40 -MaxErrorMm 1.0 -MaxRmsMm 0.5 -OutDir .\logs\binary_sweep -EnableMotion -ContinueOnFail
+```
+
+一键执行项目自检、二进制插补仿真、串口链路检查、空载电机压力测试和 CSV 误差分析：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\final_validation.ps1 -Port COM13 -Count 300 -ChunkPoints 10 -FeedPps 300 -MaxErrorMm 1.0 -MaxRmsMm 0.3 -OutDir .\logs\final_validation_latest
+```
+
+验收重点：
+
+```text
+HOSTCAP 包含 control_hz=10000 binary_traj=1 joint_interp=1
+状态帧包含 JT:<state>,accepted,executed,queued,free 和 Hz:10000
+状态帧包含 JU:underrun_ticks,max_dispatch_gap_ticks,min_buffer；稳定流式运行时 underrun_ticks 应为 0
+压测结束为 Idle/Q:0/E:0
+FEEDBACK_ERROR 或 BINARY_FEEDBACK_ERROR 不超过设定阈值
+CSV 分析的 max_x/max_y/rms_x/rms_y 用于定位单轴抖动和参数优化方向
+```
+
 ## 11. PyQt 上位机参考 UI
 
 路径：

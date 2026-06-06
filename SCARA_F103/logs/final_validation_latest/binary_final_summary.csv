@@ -1,0 +1,2 @@
+﻿"CsvPath","Count","MaxX","MaxY","MeanX","MeanY","RmsX","RmsY","MaxNorm","RmsNorm","MaxErrorLimit","RmsLimit"
+"C:\Users\22602\Desktop\SCARA\SCARA_F103\logs\final_validation_latest\binary_final.csv","95","0.290866098710978","0.459041823269303","0.0019135944805513","-0.00744889116096658","0.0782185030731091","0.139033299934311","0.478447433829394","0.159525523705838","1","0.3"

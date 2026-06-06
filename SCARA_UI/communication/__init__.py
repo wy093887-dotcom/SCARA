@@ -1,4 +1,13 @@
 from .serial_mixin import ScaraSerialMixin
 from .serial_protocol import build_g1_line, checksum, parse_ok_ack
+from .binary_trajectory_protocol import build_frame, build_begin_payload, build_chunk_payload
 
-__all__ = ["ScaraSerialMixin", "build_g1_line", "checksum", "parse_ok_ack"]
+__all__ = [
+    "ScaraSerialMixin",
+    "build_g1_line",
+    "checksum",
+    "parse_ok_ack",
+    "build_frame",
+    "build_begin_payload",
+    "build_chunk_payload",
+]

@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     UserApp/app_main.c
     UserApp/app_params.c
+    UserApp/binary_traj.c
     UserApp/gcode_stream.c
     UserApp/home_controller.c
     UserApp/home_sensor.c

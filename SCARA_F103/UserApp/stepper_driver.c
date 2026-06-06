@@ -17,13 +17,14 @@ typedef struct {
     GPIO_TypeDef *ena_port;
     uint16_t ena_pin;
     int32_t pulse_accum;
+    int32_t accel_accum;
     int32_t applied_pps;
 } StepperHw;
 
 static StepperState s_state;
 static StepperHw s_hw[2] = {
-    {BOARD_M1_TIM, BOARD_M1_TIM_CHANNEL, BOARD_M1_DIR_PORT, BOARD_M1_DIR_PIN, BOARD_M1_ENA_PORT, BOARD_M1_ENA_PIN, 0, 0},
-    {BOARD_M2_TIM, BOARD_M2_TIM_CHANNEL, BOARD_M2_DIR_PORT, BOARD_M2_DIR_PIN, BOARD_M2_ENA_PORT, BOARD_M2_ENA_PIN, 0, 0},
+    {BOARD_M1_TIM, BOARD_M1_TIM_CHANNEL, BOARD_M1_DIR_PORT, BOARD_M1_DIR_PIN, BOARD_M1_ENA_PORT, BOARD_M1_ENA_PIN, 0, 0, 0},
+    {BOARD_M2_TIM, BOARD_M2_TIM_CHANNEL, BOARD_M2_DIR_PORT, BOARD_M2_DIR_PIN, BOARD_M2_ENA_PORT, BOARD_M2_ENA_PIN, 0, 0, 0},
 };
 
 static int32_t clamp_i32(int32_t value, int32_t min_value, int32_t max_value)
@@ -148,6 +149,7 @@ void Stepper_Init(void)
         s_state.axis[i].remaining_pulse = 0;
         s_state.axis[i].error = 0;
         s_hw[i].pulse_accum = 0;
+        s_hw[i].accel_accum = 0;
         s_hw[i].applied_pps = 0;
         HAL_TIM_PWM_Start(s_hw[i].tim, s_hw[i].channel);
         pwm_apply(i, 0);
@@ -322,6 +324,16 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
     }
 
     uint32_t primask = irq_save();
+    int32_t dom_v = av1 > av2 ? av1 : av2;
+    if (dom_v > 0) {
+        int32_t base_accel = APP_ACCEL_DEFAULT;
+        if (d1 > 0 && av1 > 0) {
+            s_state.axis[0].accel_pps_s = clamp_i32((int32_t)(((int64_t)base_accel * av1) / dom_v), 1, APP_ACCEL_MAX);
+        }
+        if (d2 > 0 && av2 > 0) {
+            s_state.axis[1].accel_pps_s = clamp_i32((int32_t)(((int64_t)base_accel * av2) / dom_v), 1, APP_ACCEL_MAX);
+        }
+    }
     bool ok1 = move_prepare(0, cur1, pos1, av1, exit1);
     bool ok2 = move_prepare(1, cur2, pos2, av2, exit2);
     irq_restore(primask);
@@ -379,6 +391,7 @@ void Stepper_Zero(void)
         s_state.axis[i].target_position_pulse = 0;
         s_state.axis[i].remaining_pulse = 0;
         s_hw[i].pulse_accum = 0;
+        s_hw[i].accel_accum = 0;
     }
     irq_restore(primask);
 }
@@ -387,31 +400,17 @@ static void axis_tick(uint32_t index)
 {
     /* 1 kHz 轻量 tick：只做速度斜坡、PWM 更新和软件计脉冲，不解析串口。 */
     StepperAxisState *axis = &s_state.axis[index];
-    int32_t accel_step = axis->accel_pps_s / (int32_t)APP_CONTROL_HZ;
-
     if (!axis->enabled) {
         axis_stop_now(index);
         s_hw[index].pulse_accum = 0;
+        s_hw[index].accel_accum = 0;
         return;
-    }
-
-    if (accel_step < 1) {
-        accel_step = 1;
     }
 
     if (axis->mode == STEPPER_MODE_IDLE) {
         axis->target_pps = 0;
-        if (axis->current_pps > 0) {
-            axis->current_pps -= accel_step;
-            if (axis->current_pps < 0) {
-                axis->current_pps = 0;
-            }
-        } else if (axis->current_pps < 0) {
-            axis->current_pps += accel_step;
-            if (axis->current_pps > 0) {
-                axis->current_pps = 0;
-            }
-        }
+        axis->current_pps = 0;
+        s_hw[index].accel_accum = 0;
         pwm_apply(index, 0);
         return;
     }
@@ -437,16 +436,24 @@ static void axis_tick(uint32_t index)
         }
     }
 
-    if (axis->current_pps < axis->target_pps) {
-        axis->current_pps += accel_step;
-        if (axis->current_pps > axis->target_pps) {
-            axis->current_pps = axis->target_pps;
+    if (axis->current_pps != axis->target_pps) {
+        int32_t diff = axis->target_pps - axis->current_pps;
+        int32_t sign = diff > 0 ? 1 : -1;
+        int32_t steps = 0;
+
+        s_hw[index].accel_accum += axis->accel_pps_s;
+        while (s_hw[index].accel_accum >= (int32_t)APP_CONTROL_HZ) {
+            s_hw[index].accel_accum -= (int32_t)APP_CONTROL_HZ;
+            steps++;
         }
-    } else if (axis->current_pps > axis->target_pps) {
-        axis->current_pps -= accel_step;
-        if (axis->current_pps < axis->target_pps) {
-            axis->current_pps = axis->target_pps;
+        if (steps > 0) {
+            if (steps > abs(diff)) {
+                steps = abs(diff);
+            }
+            axis->current_pps += sign * steps;
         }
+    } else {
+        s_hw[index].accel_accum = 0;
     }
 
     pwm_apply(index, axis->current_pps);
@@ -475,9 +482,14 @@ static void axis_tick(uint32_t index)
     }
 }
 
-void Stepper_Tick1kHz(void)
+void Stepper_Tick10kHz(void)
 {
-    s_state.tick_ms++;
+    static uint8_t tick_divider;
+    tick_divider++;
+    if (tick_divider >= 10u) {
+        tick_divider = 0;
+        s_state.tick_ms++;
+    }
     axis_tick(0);
     axis_tick(1);
 }

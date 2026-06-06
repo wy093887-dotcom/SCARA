@@ -9,6 +9,7 @@ void SerialDma_Init(void);
 void SerialDma_Poll(void);
 bool SerialDma_ReadLine(char *out, size_t out_size);
 bool SerialDma_Send(const char *text);
+bool SerialDma_SendBytes(const uint8_t *data, uint16_t len);
 bool SerialDma_SendFormat(const char *fmt, ...);
 bool SerialDma_IsTxBusy(void);
 uint32_t SerialDma_RxOverflowCount(void);

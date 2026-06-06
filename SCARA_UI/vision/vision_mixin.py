@@ -102,6 +102,8 @@ class ScaraVisionMixin:
             rx, ry = self.pixel_to_robot(*obj['centroid'])
             route_points.append((rx, ry))
 
-        self.load_motion_queue(self.generate_polyline_path(route_points, spd, silent_first=True))
+        path = self.generate_polyline_path(route_points, spd, silent_first=True)
+        send_path = self.generate_binary_send_from_path(path, spd)
+        self.load_motion_queue(path, send_path=send_path)
 
     # --- 核心算法 ---

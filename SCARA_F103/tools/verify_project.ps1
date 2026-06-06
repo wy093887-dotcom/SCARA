@@ -106,7 +106,8 @@ $linker = Join-Path $projectRoot "STM32F103XX_FLASH.ld"
 $config = Join-Path $projectRoot "UserApp\app_config.h"
 Require-Text $linker "FLASH \(rx\)\s+:\s+ORIGIN = 0x8000000, LENGTH = 63K" "linker reserves final parameter page"
 Require-Text $config "APP_PARAM_FLASH_ADDR 0x0800F800u" "parameter page address is 0x0800F800"
-Require-Text $config "APP_FW_VERSION `"0\.24\.1`"" "firmware version is 0.24.1"
+Require-Text $config "APP_FW_VERSION `"0\.25\.0`"" "firmware version is 0.25.0"
+Require-Text $config "APP_CONTROL_HZ 10000u" "control loop is 10 kHz"
 Require-Text $config "APP_MOTOR1_ZERO_MRAD 2251L" "motor 1 zero offset matches symmetric UI home"
 Require-Text $config "APP_MOTOR2_ZERO_MRAD 890L" "motor 2 zero offset matches symmetric UI home"
 Require-Text $config "APP_SERIAL_BAUDRATE 115200u" "serial baudrate is 115200"
@@ -116,11 +117,24 @@ Require-Text $config "APP_SCARA_IK_LEFT_ELBOW_SIGN 1" "left IK branch is non-cro
 Require-Text $config "APP_SCARA_IK_RIGHT_ELBOW_SIGN \(-1\)" "right IK branch is non-crossed"
 Require-Text $config "APP_PARAM_FLASH_VERSION 4u" "parameter flash version invalidates old zero offsets"
 
+$timer = Join-Path $projectRoot "Core\Src\tim.c"
+Require-Text $timer "htim2\.Init\.Period = 99;" "TIM2 period is 99 for 10 kHz control tick"
+
+$binaryTraj = Join-Path $projectRoot "UserApp\binary_traj.c"
+Require-Text $binaryTraj "(?s)void BinaryTraj_Tick10kHz\(void\)\s*\{.*service_motion_10khz\(\);" "binary trajectory dispatch runs from 10 kHz tick"
+Require-Text $binaryTraj "Stepper_IsBusy\(\) \|\| s_run_requested \|\| s_state == BINARY_TRAJ_STATE_RUNNING" "binary trajectory rejects BEGIN while running between segments"
+Require-Text $binaryTraj "uint8_t payload\[32\]" "binary status includes interpolation diagnostics"
+Require-Text $binaryTraj "exit1 = v1 < nv1 \? v1 : nv1" "binary trajectory blends exit speed against next segment"
+
+$gcodeStream = Join-Path $projectRoot "UserApp\gcode_stream.c"
+Require-Text $gcodeStream "JU:%lu,%lu,%u" "ASCII status reports binary trajectory underrun diagnostics"
+
 Write-Host "== Build Rules and VS Code =="
 $cmake = Join-Path $projectRoot "CMakeLists.txt"
 Require-Text $cmake "-O ihex" "CMake generates hex"
 Require-Text $cmake "-O binary" "CMake generates bin"
 Require-Text $cmake "UserApp/gcode_stream\.c" "CMake builds gcode stream"
+Require-Text $cmake "UserApp/binary_traj\.c" "CMake builds binary joint trajectory"
 Require-Text $cmake "UserApp/home_controller\.c" "CMake builds home controller"
 Require-Text $cmake "UserApp/home_sensor\.c" "CMake builds home sensor"
 Require-Text $cmake "(?s)^(?!.*UserApp/pulse_protocol\.c)" "CMake does not build old pulse protocol"
@@ -134,11 +148,23 @@ Require-File (Join-Path $projectRoot "Run_COM13_HostPlanned_3000.bat")
 Require-File (Join-Path $projectRoot "tools\serial_link_check.ps1")
 Require-File (Join-Path $projectRoot "tools\home_sensor_check.ps1")
 Require-File (Join-Path $projectRoot "tools\gcode_stream_check.ps1")
+Require-File (Join-Path $projectRoot "tools\binary_joint_traj_stress.ps1")
+Require-File (Join-Path $projectRoot "tools\ui_binary_line_stress.ps1")
+Require-File (Join-Path $projectRoot "tools\ui_binary_car_stress.ps1")
+Require-File (Join-Path $projectRoot "tools\feedback_error_stress.ps1")
+Require-File (Join-Path $projectRoot "tools\analyze_feedback_error_csv.ps1")
+Require-File (Join-Path $projectRoot "tools\sweep_binary_feedback_error.ps1")
+Require-File (Join-Path $projectRoot "tools\simulate_binary_interpolator.ps1")
+Require-File (Join-Path $projectRoot "tools\final_validation.ps1")
 Require-File (Join-Path $projectRoot "tools\host_planned_stream_stress.ps1")
 Require-File (Join-Path $projectRoot "tools\ui_control_matrix_check.ps1")
 Require-File (Join-Path $projectRoot "tools\ui_trajectory_stress.ps1")
 Require-DocFile "..\SCARA_UI\V_monitor.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\V_monitor.py"
 Require-DocFile "..\SCARA_UI\tests\trajectory_planner_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\trajectory_planner_check.py"
+Require-DocFile "..\SCARA_UI\tests\feedback_error_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\feedback_error_check.py"
+
+$binaryStress = Join-Path $projectRoot "tools\binary_joint_traj_stress.ps1"
+Require-Text $binaryStress "BINARY_JOINT_DIAG" "binary trajectory stress reports underrun diagnostics"
 
 Write-Host "== Documentation =="
 Require-DocFile "..\Version.md" "C:\Users\22602\Desktop\SCARA\Version.md"

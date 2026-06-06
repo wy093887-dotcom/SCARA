@@ -3,6 +3,7 @@
 /* USART1 DMA 串口层：接收字节流、切成行队列，并用 TX 队列避免响应丢失。 */
 
 #include "app_config.h"
+#include "binary_traj.h"
 #include "board_pins.h"
 
 #include <stdarg.h>
@@ -105,6 +106,10 @@ void SerialDma_Init(void)
 
 static void feed_char(char ch)
 {
+    if (BinaryTraj_FeedByte((uint8_t)ch)) {
+        return;
+    }
+
     /* 实时字符 ?/!/~/Ctrl-X 单独成行；普通命令以换行结束。 */
     if (ch == '?' || ch == '!' || ch == '~' || (uint8_t)ch == 0x18u) {
         char rt[2];
@@ -175,7 +180,15 @@ bool SerialDma_Send(const char *text)
         return false;
     }
 
-    size_t len = strlen(text);
+    return SerialDma_SendBytes((const uint8_t *)text, (uint16_t)strlen(text));
+}
+
+bool SerialDma_SendBytes(const uint8_t *data, uint16_t len)
+{
+    if (data == NULL) {
+        return false;
+    }
+
     if (len == 0u) {
         return true;
     }
@@ -190,8 +203,8 @@ bool SerialDma_Send(const char *text)
         return false;
     }
 
-    memcpy(s_tx_queue[s_tx_head], text, len);
-    s_tx_len[s_tx_head] = (uint16_t)len;
+    memcpy(s_tx_queue[s_tx_head], data, len);
+    s_tx_len[s_tx_head] = len;
     s_tx_head = queue_next(s_tx_head, APP_SERIAL_TX_QUEUE_DEPTH);
     s_tx_count++;
     bool ok = tx_start_next_locked();

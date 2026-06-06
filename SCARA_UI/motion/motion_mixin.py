@@ -4,11 +4,25 @@ import numpy as np
 
 class ScaraMotionMixin:
     JOINT_LIMITS_DEG = ((-180.0, 180.0), (0.0, 360.0))
+    # 轨迹精度参数说明：
+    # - BINARY_LINE_TOLERANCE_MM：上位机把一条直线拆成二进制关键点时，允许的关节空间线性化误差。
+    #   调小会更贴合直线，但关键点增多、上传更慢；调大则点数少但末端更容易偏离期望线。
+    # - BINARY_ARC_SEGMENT_MM：圆弧关键点弧长间隔。调小圆弧更圆滑，调大会减少通信量。
+    # - DEFAULT/CAR_CORNER_RADIUS_MM：默认设为 0，表示所有折线必须到达原始转折点，不提前圆角切入。
     ARC_SEGMENT_MM = 2.0
-    DEFAULT_CORNER_RADIUS_MM = 2.0
-    CAR_CORNER_RADIUS_MM = 1.0
+    BINARY_ARC_SEGMENT_MM = 0.75
+    BINARY_LINE_TOLERANCE_MM = 0.45
+    BINARY_LINE_MAX_SEGMENT_MM = 10.0
+    BINARY_PATH_SIMPLIFY_TOLERANCE_MM = 0.08
+    BINARY_MRAD_PER_REV = 6283
+    BINARY_ZERO_MRAD = (2251, 890)
+    DEFAULT_CORNER_RADIUS_MM = 0.0
+    CAR_CORNER_RADIUS_MM = 0.0
     PATH_SIMPLIFY_TOLERANCE_MM = 0.18
     PATH_MIN_POINT_SPACING_MM = 0.20
+    TEXT_SIMPLIFY_TOLERANCE_MM = 0.06
+    TEXT_MIN_POINT_SPACING_MM = 0.16
+    TEXT_CORNER_RADIUS_MM = 0.8
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
@@ -198,6 +212,166 @@ class ScaraMotionMixin:
             return []
         return path
 
+    def generate_binary_targets_for_segments(self, segments, speed_max, start=None, include_connector=True):
+        """把几何段转换为下位机二进制关节插补关键点。
+
+        直线段只保留必要关键点，由下位机在关节空间同步插补；圆弧段按
+        BINARY_ARC_SEGMENT_MM 采样。这里不做 UI 仿真绘图，只准备要上传给 MCU 的目标点。
+        """
+        segments = [segment for segment in segments if segment and segment.length > 0.001]
+        if not segments:
+            return []
+        feed_mm_min = float(speed_max) * 60.0
+        cursor = (float(start[0]), float(start[1])) if start is not None else tuple(segments[0].start)
+        targets = []
+
+        def append_points(points, silent=False):
+            for x, y in points:
+                if targets and math.hypot(float(x) - targets[-1][0], float(y) - targets[-1][1]) <= 0.001:
+                    continue
+                targets.append((float(x), float(y), feed_mm_min, silent))
+
+        if include_connector and math.hypot(cursor[0] - segments[0].start[0], cursor[1] - segments[0].start[1]) > 0.01:
+            connector = self.generate_binary_line_targets(cursor, segments[0].start, speed_max, silent=True)
+            targets.extend(connector)
+            cursor = tuple(segments[0].start)
+
+        for segment in segments:
+            if math.hypot(cursor[0] - segment.start[0], cursor[1] - segment.start[1]) > 0.01:
+                append_points([(p[0], p[1]) for p in self.generate_binary_line_targets(cursor, segment.start, speed_max, silent=True)], silent=True)
+            if segment.kind == "arc":
+                count = max(2, int(math.ceil(segment.length / self.BINARY_ARC_SEGMENT_MM)))
+                points = [segment.point_at(segment.length * i / count) for i in range(1, count + 1)]
+                append_points(points)
+            else:
+                line_targets = self.generate_binary_line_targets(segment.start, segment.end, speed_max, silent=False)
+                for item in line_targets:
+                    if targets and math.hypot(float(item[0]) - targets[-1][0], float(item[1]) - targets[-1][1]) <= 0.001:
+                        continue
+                    targets.append(item)
+            cursor = tuple(segment.end)
+
+        if targets and not self.validate_trajectory_points(targets, "二进制图形关键点"):
+            return []
+        return targets
+
+    def generate_geometry_motion(self, segments, speed_max, label="固定轨迹"):
+        """生成固定图形的双轨迹：preview 用于界面显示，send_path 用于 MCU 二进制插补。"""
+        if not segments:
+            self.log_error(f"{label}没有有效几何段")
+            return [], []
+        preview = []
+        start = (self.cur_x, self.cur_y)
+        first = segments[0].start
+        if math.hypot(first[0] - start[0], first[1] - start[1]) > 0.01:
+            connector = self.generate_linear_path(start[0], start[1], first[0], first[1], speed_max, silent=True)
+            if not connector:
+                self.log_error(f"{label}连接到起点失败: 当前({start[0]:.1f},{start[1]:.1f}) -> 起点({first[0]:.1f},{first[1]:.1f})")
+                return [], []
+            preview.extend(connector)
+        body = self.generate_geometry_path(segments, speed_max, silent_first=True, label=label)
+        if not body:
+            return [], []
+        preview.extend(body)
+        send_path = self.generate_binary_targets_for_segments(segments, speed_max, start=start, include_connector=True)
+        return preview, send_path
+
+    def generate_binary_send_from_path(self, path, speed_max=None, start=None, simplify_tolerance=None):
+        if not path:
+            return []
+        start = (float(start[0]), float(start[1])) if start is not None else (float(self.cur_x), float(self.cur_y))
+        tolerance = self.BINARY_PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else float(simplify_tolerance)
+        result = []
+        cursor = start
+        chunk = []
+        chunk_silent = None
+
+        def point_silent(point):
+            return bool(point[3]) if len(point) > 3 else False
+
+        def point_feed_mm_s(point):
+            if speed_max is not None:
+                return max(0.1, float(speed_max))
+            if len(point) > 2:
+                return max(0.1, float(point[2]) / 60.0)
+            return 1.0
+
+        def append_targets(targets):
+            for item in targets:
+                if result and math.hypot(float(item[0]) - result[-1][0], float(item[1]) - result[-1][1]) <= 0.001:
+                    continue
+                result.append(item)
+
+        def nearest_feed(points, target, start_index):
+            if not points:
+                return max(0.1, float(speed_max or 1.0)), start_index
+            best_index = start_index
+            best_dist = float("inf")
+            for index in range(start_index, len(points)):
+                dist = math.hypot(float(points[index][0]) - target[0], float(points[index][1]) - target[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_index = index
+                elif index > best_index and dist > best_dist:
+                    break
+            return point_feed_mm_s(points[best_index]), best_index
+
+        def flush_chunk(points, silent):
+            nonlocal cursor
+            if not points:
+                return
+            coords = [cursor] + [(float(p[0]), float(p[1])) for p in points]
+            simplified = self._rdp_points_preserve_turns(coords, tolerance) if len(coords) > 2 and tolerance > 0.0 else coords
+            source_index = 0
+            for target in simplified[1:]:
+                if math.hypot(target[0] - cursor[0], target[1] - cursor[1]) <= 0.001:
+                    continue
+                feed_mm_s, source_index = nearest_feed(points, target, source_index)
+                append_targets(self.generate_binary_line_targets(cursor, target, feed_mm_s, silent=silent))
+                cursor = target
+
+        for point in path:
+            silent = point_silent(point)
+            if chunk and silent != chunk_silent:
+                flush_chunk(chunk, chunk_silent)
+                chunk = []
+            chunk.append(point)
+            chunk_silent = silent
+        flush_chunk(chunk, chunk_silent)
+
+        if result and not self.validate_trajectory_points(result, "二进制简化轨迹关键点"):
+            return []
+        return result
+
+    def _rdp_points_preserve_turns(self, points, epsilon):
+        if len(points) <= 2:
+            return list(points)
+        breaks = [0]
+        for index in range(1, len(points) - 1):
+            ax, ay = points[index - 1]
+            bx, by = points[index]
+            cx, cy = points[index + 1]
+            v1x, v1y = bx - ax, by - ay
+            v2x, v2y = cx - bx, cy - by
+            l1 = math.hypot(v1x, v1y)
+            l2 = math.hypot(v2x, v2y)
+            if l1 <= 1e-6 or l2 <= 1e-6:
+                continue
+            dot = (v1x * v2x + v1y * v2y) / (l1 * l2)
+            if dot < 0.985:
+                breaks.append(index)
+        breaks.append(len(points) - 1)
+
+        simplified = []
+        for start_index, end_index in zip(breaks, breaks[1:]):
+            section = points[start_index : end_index + 1]
+            reduced = self._rdp_points(section, epsilon) if len(section) > 2 else section
+            if simplified:
+                simplified.extend(reduced[1:])
+            else:
+                simplified.extend(reduced)
+        return simplified
+
     def generate_arc_control_points(self, start, end, radius, clockwise):
         sx, sy = start
         ex, ey = end
@@ -231,7 +405,7 @@ class ScaraMotionMixin:
 
         _, cx, cy, a0, delta = min(candidates, key=lambda item: item[0])
         arc_len = abs(delta) * radius
-        segments = max(8, int(math.ceil(arc_len / self.ARC_SEGMENT_MM)))
+        segments = max(8, int(math.ceil(arc_len / self.BINARY_ARC_SEGMENT_MM)))
         segments = min(segments, 5000)
         points = []
         for i in range(segments + 1):
@@ -241,6 +415,89 @@ class ScaraMotionMixin:
         points[0] = start
         points[-1] = end
         return points
+
+    def generate_binary_arc_targets(self, start, end, radius, clockwise, speed_max, silent=False):
+        points = self.generate_arc_control_points(start, end, radius, clockwise)
+        if not self.validate_trajectory_points(points, "二进制圆弧关键点"):
+            return []
+        feed_mm_min = float(speed_max) * 60.0
+        return [(x, y, feed_mm_min, silent) for x, y in points[1:]]
+
+    def _binary_pulse_from_xy(self, point, ppr):
+        q1, q2 = self.inverse_kinematics(float(point[0]), float(point[1]))
+        if q1 is None or q2 is None:
+            return None
+        theta1_mrad = int(round(math.radians(q1) * 1000.0))
+        theta2_mrad = int(round(math.radians(q2) * 1000.0))
+        p1 = int(round(((theta1_mrad - self.BINARY_ZERO_MRAD[0]) * int(ppr)) / self.BINARY_MRAD_PER_REV))
+        p2 = int(round(((theta2_mrad - self.BINARY_ZERO_MRAD[1]) * int(ppr)) / self.BINARY_MRAD_PER_REV))
+        return p1, p2
+
+    def _binary_xy_from_pulse(self, p1, p2, ppr):
+        q1 = math.degrees(((float(p1) * self.BINARY_MRAD_PER_REV / float(ppr)) + self.BINARY_ZERO_MRAD[0]) / 1000.0)
+        q2 = math.degrees(((float(p2) * self.BINARY_MRAD_PER_REV / float(ppr)) + self.BINARY_ZERO_MRAD[1]) / 1000.0)
+        return self.kinematics.forward(q1, q2)
+
+    def _point_to_line_error(self, point, start, end):
+        px, py = point
+        ax, ay = start
+        bx, by = end
+        vx = bx - ax
+        vy = by - ay
+        den = vx * vx + vy * vy
+        if den <= 1e-12:
+            return math.hypot(px - ax, py - ay)
+        t = ((px - ax) * vx + (py - ay) * vy) / den
+        t = max(0.0, min(1.0, t))
+        qx = ax + vx * t
+        qy = ay + vy * t
+        return math.hypot(px - qx, py - qy)
+
+    def _joint_linearized_line_error(self, start, end, ppr):
+        p0 = self._binary_pulse_from_xy(start, ppr)
+        p1 = self._binary_pulse_from_xy(end, ppr)
+        if p0 is None or p1 is None:
+            return float("inf")
+        max_error = 0.0
+        steps = max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1]), 1)
+        if steps <= 64:
+            sample_indices = range(1, steps)
+        else:
+            sample_indices = [int(round(steps * i / 32.0)) for i in range(1, 32)]
+        for index in sample_indices:
+            t = index / steps
+            ip1 = int(round(p0[0] + (p1[0] - p0[0]) * t))
+            ip2 = int(round(p0[1] + (p1[1] - p0[1]) * t))
+            xy = self._binary_xy_from_pulse(ip1, ip2, ppr)
+            if xy[0] is None or xy[1] is None:
+                return float("inf")
+            max_error = max(max_error, self._point_to_line_error(xy, start, end))
+        return max_error
+
+    def _adaptive_binary_line_points(self, start, end, ppr, depth=0):
+        """按关节脉冲量化误差递归拆分直线，确保下位机关节插补后仍贴近笛卡尔直线。"""
+        length = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+        error = self._joint_linearized_line_error(start, end, ppr)
+        if (
+            depth >= 12
+            or length <= 0.10
+            or (length <= self.BINARY_LINE_MAX_SEGMENT_MM and error <= self.BINARY_LINE_TOLERANCE_MM)
+        ):
+            return [end]
+        mid = ((float(start[0]) + float(end[0])) * 0.5, (float(start[1]) + float(end[1])) * 0.5)
+        return (
+            self._adaptive_binary_line_points(start, mid, ppr, depth + 1)
+            + self._adaptive_binary_line_points(mid, end, ppr, depth + 1)
+        )
+
+    def generate_binary_line_targets(self, start, end, speed_max, silent=False):
+        """生成一条直线的二进制关键点；实际插补在下位机 10kHz 控制周期内完成。"""
+        ppr = int(getattr(self, "current_ppr", 3200))
+        keypoints = self._adaptive_binary_line_points(start, end, ppr)
+        if not self.validate_trajectory_points(keypoints, "二进制直线关键点"):
+            return []
+        feed_mm_min = float(speed_max) * 60.0
+        return [(float(x), float(y), feed_mm_min, silent) for x, y in keypoints]
 
     def start_recording(self):
         self.teach_data = [] 
@@ -267,7 +524,8 @@ class ScaraMotionMixin:
             pts = [(self.cur_x, self.cur_y)] + self.teach_points
             path = self.generate_polyline_path(pts, v, silent_first=True)
             self.preview_planned_path(path, "示教复现")
-            self.load_motion_queue(path)
+            send_path = self.generate_binary_send_from_path(path, v)
+            self.load_motion_queue(path, send_path=send_path)
 
     def preview_planned_path(self, path, label):
         if hasattr(self, "set_planned_preview"):
@@ -284,30 +542,33 @@ class ScaraMotionMixin:
 
             if mode.startswith("G1"):
                 path = self.generate_linear_path(self.cur_x, self.cur_y, tx, ty, v, silent=silent)
+                send_path = self.generate_binary_line_targets(start, end, v, silent=silent)
                 label = "G1 直线"
             elif mode.startswith("G2") or mode.startswith("G3"):
                 radius = self._read_float(self.radius_r, "圆弧半径", positive=True)
+                clockwise = mode.startswith("G2")
                 path = self.generate_arc_path(
                     start[0],
                     start[1],
                     end[0],
                     end[1],
                     radius,
-                    clockwise=mode.startswith("G2"),
+                    clockwise=clockwise,
                     speed_max=v,
                     silent=silent,
                 )
+                send_path = self.generate_binary_arc_targets(start, end, radius, clockwise, v, silent=silent)
                 label = "G2 顺圆" if mode.startswith("G2") else "G3 逆圆"
             else:
                 raise ValueError(f"不支持的轨迹模式: {mode}")
 
-            if not path:
+            if not path or not send_path:
                 self.log_error(f"{label}未生成可发送轨迹")
                 return
             self.preview_planned_path(path, label)
-            self.load_motion_queue(path)
+            self.load_motion_queue(path, send_path=send_path)
             self.log_display.append(
-                f"<font color='cyan'>{label}规划完成: {len(path)} 点，目标 X={tx:.1f}, Y={ty:.1f}</font>"
+                f"<font color='cyan'>{label}规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点，目标 X={tx:.1f}, Y={ty:.1f}</font>"
             )
         except ValueError as e:
             self.log_error(f"轨迹参数错误: {e}")
@@ -357,7 +618,6 @@ class ScaraMotionMixin:
                 origin,
                 [(0, 0), (0, 24), (72, 24), (72, 48), (108, 48), (120, 36), (120, 0), (108, 0)],
                 radius=self.CAR_CORNER_RADIUS_MM,
-                keep_corners={4, 5},
             )
         )
         raw.append(self._arc(origin, (108, 0), (84, 0), 12, clockwise=True))
@@ -374,7 +634,6 @@ class ScaraMotionMixin:
                 origin,
                 [(0, 0), (0, 20), (40, 20), (60, 40), (120, 40), (140, 20), (160, 20), (160, 0), (140, 0)],
                 radius=self.CAR_CORNER_RADIUS_MM,
-                keep_corners={3, 4, 5},
             )
         )
         raw.append(self._arc(origin, (140, 0), (116, 0), 12, clockwise=True))
@@ -388,9 +647,14 @@ class ScaraMotionMixin:
             x0 = self._read_float(self.car_start_x, "小车起始X")
             y0 = self._read_float(self.car_start_y, "小车起始Y")
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path = self.generate_geometry_path(self.build_car1_segments(x0, y0), v, silent_first=True, label="小车轨迹1")
+            path, send_path = self.generate_geometry_motion(self.build_car1_segments(x0, y0), v, label="小车轨迹1")
+            if not path or not send_path:
+                return
             self.preview_planned_path(path, "小车轨迹1")
-            self.load_motion_queue(path)
+            self.load_motion_queue(path, send_path=send_path)
+            self.log_display.append(
+                f"<font color='cyan'>小车轨迹1规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点</font>"
+            )
         except ValueError as e:
             self.log_error(f"小车轨迹1参数错误: {e}")
         except Exception as e:
@@ -401,24 +665,44 @@ class ScaraMotionMixin:
             x0 = self._read_float(self.car_start_x, "小车起始X")
             y0 = self._read_float(self.car_start_y, "小车起始Y")
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path = self.generate_geometry_path(self.build_car2_segments(x0, y0), v, silent_first=True, label="小车轨迹2")
+            path, send_path = self.generate_geometry_motion(self.build_car2_segments(x0, y0), v, label="小车轨迹2")
+            if not path or not send_path:
+                return
             self.preview_planned_path(path, "小车轨迹2")
-            self.load_motion_queue(path)
+            self.load_motion_queue(path, send_path=send_path)
+            self.log_display.append(
+                f"<font color='cyan'>小车轨迹2规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点</font>"
+            )
         except ValueError as e:
             self.log_error(f"小车轨迹2参数错误: {e}")
         except Exception as e:
             self.log_error(f"小车轨迹2规划错误: {e}")
 
-    def generate_stroke_path(self, strokes, speed_max, label="写字轨迹"):
+    def generate_stroke_path(
+        self,
+        strokes,
+        speed_max,
+        label="写字轨迹",
+        simplify_tolerance=None,
+        min_spacing=None,
+        corner_radius_mm=None,
+        optimize_closed_start=False,
+    ):
         path = []
         current = (self.cur_x, self.cur_y)
         valid_strokes = []
+        simplify_tolerance = self.PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else simplify_tolerance
+        min_spacing = self.PATH_MIN_POINT_SPACING_MM if min_spacing is None else min_spacing
+        corner_radius_mm = self.DEFAULT_CORNER_RADIUS_MM if corner_radius_mm is None else corner_radius_mm
         for stroke in strokes:
+            was_closed = self._is_closed_stroke(stroke, threshold=max(0.01, min_spacing * 1.5))
             clean = self.preprocess_control_points(
                 stroke,
-                simplify_tolerance=self.PATH_SIMPLIFY_TOLERANCE_MM,
-                min_spacing=self.PATH_MIN_POINT_SPACING_MM,
+                simplify_tolerance=simplify_tolerance,
+                min_spacing=min_spacing,
             )
+            if was_closed and len(clean) >= 3 and not self._is_closed_stroke(clean, threshold=max(0.01, min_spacing * 1.5)):
+                clean.append(clean[0])
             if len(clean) >= 2:
                 valid_strokes.append(clean)
 
@@ -427,7 +711,9 @@ class ScaraMotionMixin:
             return []
 
         for stroke in valid_strokes:
-            if math.hypot(stroke[-1][0] - current[0], stroke[-1][1] - current[1]) < math.hypot(
+            if optimize_closed_start and self._is_closed_stroke(stroke, threshold=max(0.01, min_spacing * 1.5)):
+                stroke = self._rotate_closed_stroke_near_current(stroke, current)
+            elif math.hypot(stroke[-1][0] - current[0], stroke[-1][1] - current[1]) < math.hypot(
                 stroke[0][0] - current[0], stroke[0][1] - current[1]
             ):
                 stroke = list(reversed(stroke))
@@ -443,7 +729,7 @@ class ScaraMotionMixin:
             planned = self.path_planner.plan_rounded_polyline(
                 stroke,
                 feed_mm_s=speed_max,
-                corner_radius_mm=self.DEFAULT_CORNER_RADIUS_MM,
+                corner_radius_mm=corner_radius_mm,
                 silent_first=False,
             )
             stroke_path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
@@ -453,6 +739,39 @@ class ScaraMotionMixin:
             current = stroke[-1]
 
         return path
+
+    def _is_closed_stroke(self, stroke, threshold=0.35):
+        if len(stroke) < 3:
+            return False
+        return math.hypot(stroke[0][0] - stroke[-1][0], stroke[0][1] - stroke[-1][1]) <= threshold
+
+    def _rotate_closed_stroke_near_current(self, stroke, current):
+        points = list(stroke)
+        if len(points) >= 2 and self._is_closed_stroke(points):
+            points = points[:-1]
+        if len(points) < 3:
+            return list(stroke)
+
+        best = None
+        for candidate in (points, list(reversed(points))):
+            for index, point in enumerate(candidate):
+                distance = math.hypot(point[0] - current[0], point[1] - current[1])
+                if best is None or distance < best[0]:
+                    rotated = candidate[index:] + candidate[:index]
+                    best = (distance, rotated)
+        rotated = best[1]
+        return rotated + [rotated[0]]
+
+    def _signed_area(self, points):
+        area = 0.0
+        for p0, p1 in zip(points, points[1:]):
+            area += p0[0] * p1[1] - p1[0] * p0[1]
+        return area * 0.5
+
+    def _stroke_bounds(self, stroke):
+        xs = [point[0] for point in stroke]
+        ys = [point[1] for point in stroke]
+        return min(xs), max(xs), min(ys), max(ys)
 
     def _order_text_strokes(self, strokes):
         boxed = []
@@ -522,7 +841,8 @@ class ScaraMotionMixin:
             path = self.generate_stroke_path(strokes, v, label="手写轨迹")
             if path:
                 self.preview_planned_path(path, "手写轨迹")
-                self.load_motion_queue(path)
+                send_path = self.generate_binary_send_from_path(path, v)
+                self.load_motion_queue(path, send_path=send_path)
                 self.log_display.append(f"<font color='cyan'>手写轨迹已装载: {len(path)} 点</font>")
         except Exception as e:
             self.log_error(f"手写轨迹规划错误: {e}")
@@ -534,33 +854,68 @@ class ScaraMotionMixin:
         self.preview_label = ""
         self.update_plot()
 
-    def build_text_outline_strokes(self, text, max_width_mm=135.0, max_height_mm=85.0):
-        from PySide6.QtGui import QFont, QFontDatabase, QPainterPath, QTransform
+    def build_text_outline_strokes(
+        self,
+        text,
+        font_family=None,
+        height_mm=80.0,
+        max_width_mm=135.0,
+        max_height_mm=85.0,
+    ):
+        from PySide6.QtGui import QFont, QFontDatabase, QFontMetricsF, QPainterPath, QTransform
         from PySide6.QtWidgets import QApplication
 
         if QApplication.instance() is None:
             self._text_outline_qt_app = QApplication([])
 
+        text = str(text).strip()
+        if not text:
+            return []
+
         try:
             families = set(QFontDatabase.families())
         except TypeError:
             families = set(QFontDatabase().families())
-        family = "Microsoft YaHei" if "Microsoft YaHei" in families else QFont().family()
-        font = QFont(family, 100)
-        painter_path = QPainterPath()
-        painter_path.addText(0.0, 0.0, font, text)
-        polygons = painter_path.toSubpathPolygons(QTransform())
+        if font_family and font_family in families:
+            family = font_family
+        else:
+            family = "Microsoft YaHei" if "Microsoft YaHei" in families else QFont().family()
 
-        raw_strokes = []
+        font = QFont(family, 100)
+        metrics = QFontMetricsF(font)
+        line_step = max(110.0, metrics.lineSpacing() * 1.15)
+        raw_items = []
         all_points = []
-        for polygon in polygons:
-            points = [(float(point.x()), float(point.y())) for point in polygon]
-            if len(points) < 3:
-                continue
-            if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) > 0.01:
-                points.append(points[0])
-            raw_strokes.append(points)
-            all_points.extend(points)
+
+        for line_index, line in enumerate(text.splitlines() or [text]):
+            x_cursor = 0.0
+            y_offset = line_index * line_step
+            for char_index, char in enumerate(line):
+                if char.isspace():
+                    x_cursor += max(35.0, metrics.horizontalAdvance(char))
+                    continue
+
+                painter_path = QPainterPath()
+                painter_path.addText(x_cursor, y_offset, font, char)
+                polygons = painter_path.toSubpathPolygons(QTransform())
+                char_strokes = []
+                for polygon in polygons:
+                    points = [(float(point.x()), float(point.y())) for point in polygon]
+                    if len(points) < 3:
+                        continue
+                    if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) > 0.01:
+                        points.append(points[0])
+                    char_strokes.append(points)
+                    all_points.extend(points)
+
+                if char_strokes:
+                    raw_items.append({"line": line_index, "char": char_index, "strokes": char_strokes})
+
+                advance = metrics.horizontalAdvance(char)
+                if advance <= 1.0:
+                    bounds = painter_path.boundingRect()
+                    advance = bounds.width() + 8.0
+                x_cursor += max(advance, 24.0)
 
         if not all_points:
             return []
@@ -571,35 +926,98 @@ class ScaraMotionMixin:
         max_y = max(p[1] for p in all_points)
         text_w = max(1.0, max_x - min_x)
         text_h = max(1.0, max_y - min_y)
-        scale = min(max_width_mm / text_w, max_height_mm / text_h)
+        target_h = min(float(height_mm), float(max_height_mm))
+        scale = min(float(max_width_mm) / text_w, target_h / text_h)
         out_w = text_w * scale
         out_h = text_h * scale
         left = self.HOME_X - out_w * 0.5
         bottom = self.HOME_Y - out_h * 0.5
 
         strokes = []
-        for raw in raw_strokes:
-            converted = []
-            for x, y in raw:
-                rx = left + (x - min_x) * scale
-                ry = bottom + (max_y - y) * scale
-                converted.append((rx, ry))
-            clean = self.preprocess_control_points(converted, simplify_tolerance=0.18, min_spacing=0.35)
-            if len(clean) >= 3:
-                if math.hypot(clean[0][0] - clean[-1][0], clean[0][1] - clean[-1][1]) > 0.35:
-                    clean.append(clean[0])
-                strokes.append(clean)
-        return self._order_text_strokes(strokes)
+        for item in sorted(raw_items, key=lambda value: (value["line"], value["char"])):
+            converted_strokes = []
+            for raw in item["strokes"]:
+                converted = []
+                for x, y in raw:
+                    rx = left + (x - min_x) * scale
+                    ry = bottom + (max_y - y) * scale
+                    converted.append((rx, ry))
+                clean = self.preprocess_control_points(
+                    converted,
+                    simplify_tolerance=self.TEXT_SIMPLIFY_TOLERANCE_MM,
+                    min_spacing=self.TEXT_MIN_POINT_SPACING_MM,
+                )
+                if len(clean) >= 3:
+                    if not self._is_closed_stroke(clean, threshold=self.TEXT_MIN_POINT_SPACING_MM * 1.5):
+                        clean.append(clean[0])
+                    min_sx, max_sx, min_sy, max_sy = self._stroke_bounds(clean)
+                    converted_strokes.append(
+                        {
+                            "stroke": clean,
+                            "area": abs(self._signed_area(clean)),
+                            "min_x": min_sx,
+                            "max_x": max_sx,
+                            "min_y": min_sy,
+                            "max_y": max_sy,
+                        }
+                    )
+
+            for contour in sorted(converted_strokes, key=lambda value: (-value["area"], value["min_x"], -value["max_y"])):
+                strokes.append(contour["stroke"])
+        return strokes
+
+    def _read_text_outline_options(self, override_text=None):
+        text = override_text if override_text is not None else self.text_outline_input.text()
+        text = str(text).strip()
+        if not text:
+            raise ValueError("文字内容不能为空")
+
+        font_family = None
+        if hasattr(self, "text_font_combo"):
+            font_family = self.text_font_combo.currentFont().family()
+
+        height_mm = 80.0
+        if hasattr(self, "text_height_input"):
+            height_mm = self._read_float(self.text_height_input, "文字高度", positive=True)
+        return text, font_family, height_mm
+
+    def _plan_text_outline(self, text=None, load=False):
+        v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
+        text, font_family, height_mm = self._read_text_outline_options(text)
+        strokes = self.build_text_outline_strokes(text, font_family=font_family, height_mm=height_mm)
+        path = self.generate_stroke_path(
+            strokes,
+            v,
+            label=f"空心字{text}",
+            simplify_tolerance=self.TEXT_SIMPLIFY_TOLERANCE_MM,
+            min_spacing=self.TEXT_MIN_POINT_SPACING_MM,
+            corner_radius_mm=self.TEXT_CORNER_RADIUS_MM,
+            optimize_closed_start=True,
+        )
+        if path:
+            self.preview_planned_path(path, f"空心字{text}")
+            if load:
+                send_path = self.generate_binary_send_from_path(path, v)
+                self.load_motion_queue(path, send_path=send_path)
+                self.log_display.append(f"<font color='cyan'>空心字{text}已装载: {len(path)} 点</font>")
+            else:
+                self.log_display.append(f"<font color='cyan'>空心字{text}预览完成: {len(path)} 点</font>")
+
+    def preview_text_outline_path(self):
+        try:
+            self._plan_text_outline(load=False)
+        except Exception as e:
+            self.log_error(f"空心字预览错误: {e}")
+
+    def plan_text_outline_path(self):
+        try:
+            self._plan_text_outline(load=True)
+        except Exception as e:
+            self.log_error(f"空心字规划错误: {e}")
 
     def plan_fixed_text_path(self, text):
         try:
-            v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            strokes = self.build_text_outline_strokes(text)
-            path = self.generate_stroke_path(strokes, v, label=f"空心字{text}")
-            if path:
-                self.preview_planned_path(path, f"空心字{text}")
-                self.load_motion_queue(path)
-                self.log_display.append(f"<font color='cyan'>空心字{text}已装载: {len(path)} 点</font>")
+            self._plan_text_outline(text=text, load=True)
         except Exception as e:
             self.log_error(f"空心字{text}规划错误: {e}")
 
@@ -629,10 +1047,18 @@ class ScaraMotionMixin:
         else: self.log_error("串口未连接")
         
     def stop_motion(self):
+        if hasattr(self, "_stop_binary_stream"):
+            self._stop_binary_stream()
         self.point_queue = []
         self.waiting_for_ack = False
         self.stream_waiting_buffer = False
         self.last_sent_motion = None
+        self.emergency_resume_path = []
+        self.active_binary_send_path = []
+        self.active_preview_path = []
+        self.emergency_paused = False
+        if hasattr(self, "_set_emergency_button_paused"):
+            self._set_emergency_button_paused(False)
         self.motion_preamble_needed = True
         self.timeout_timer.stop()
         ts = self.get_timestamp()
@@ -643,24 +1069,90 @@ class ScaraMotionMixin:
             self.ser.write(b"STOP\n")
 
     def emergency_stop(self):
+        if getattr(self, "emergency_paused", False):
+            self._resume_emergency_motion()
+            return
+
+        if hasattr(self, "_stop_binary_stream"):
+            self._stop_binary_stream()
         if self.last_sent_motion is not None:
             self.point_queue.insert(0, self.last_sent_motion)
             self.last_sent_motion = None
             self.sent_point_id = max(0, self.sent_point_id - 1)
+        self.emergency_resume_path = self._capture_emergency_resume_path()
         self.waiting_for_ack = False
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
         self.timeout_timer.stop()
+        self.emergency_paused = True
+        if hasattr(self, "_set_emergency_button_paused"):
+            self._set_emergency_button_paused(True)
         ts = self.get_timestamp()
         self.log_display.append(
-            f"<font color='#e74c3c'>TX {ts} ESTOP (\u6025\u505c\uff1a\u4fdd\u7559\u4e0a\u4f4d\u673a\u961f\u5217)</font>"
+            f"<font color='#e74c3c'>TX {ts} ESTOP (pause and keep remaining queue)</font>"
         )
         if self.ser and self.ser.is_open:
             self.ser.write(b"ESTOP\n")
 
+    def _capture_emergency_resume_path(self):
+        if getattr(self, "point_queue", None):
+            return list(self.point_queue)
+        send_path = list(getattr(self, "active_binary_send_path", []) or [])
+        if not send_path:
+            return []
+        cx, cy = float(self.cur_x), float(self.cur_y)
+        best_index = 0
+        best_dist = float("inf")
+        for index, point in enumerate(send_path):
+            dist = math.hypot(float(point[0]) - cx, float(point[1]) - cy)
+            if dist < best_dist:
+                best_dist = dist
+                best_index = index
+        remaining = send_path[min(best_index + 1, len(send_path)) :]
+        return list(remaining)
+
+    def _resume_emergency_motion(self):
+        remaining = list(getattr(self, "emergency_resume_path", []) or [])
+        self.emergency_paused = False
+        if hasattr(self, "_set_emergency_button_paused"):
+            self._set_emergency_button_paused(False)
+        self.motion_preamble_needed = True
+        if self.ser and self.ser.is_open:
+            self.ser.write(b"CLEAR_ERROR\n")
+            self.ser.write(b"ENABLE 1\n")
+        if not remaining:
+            self.log_display.append("<font color='orange'>RESUME: no remaining motion queue.</font>")
+            return
+        self.log_display.append(
+            f"<font color='#2ecc71'>RESUME: reloading {len(remaining)} remaining keypoints.</font>"
+        )
+        self.emergency_resume_path = []
+        self.load_motion_queue(remaining, send_path=remaining)
+
+    def _set_emergency_button_paused(self, paused):
+        button = getattr(self, "btn_emergency_stop", None)
+        if button is None:
+            return
+        if paused:
+            button.setText("恢复运动")
+            button.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+        else:
+            button.setText("急停 (保留队列)")
+            button.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+
     def add_jog(self, dx, dy):
+        """方向点动：空闲时走二进制关节插补，运动队列中才退回 ASCII 追加。
+
+        调节入口：
+        - 点动距离来自 UI 按钮绑定的 dx/dy。
+        - 点动速度来自 jog_speed_input，单位 mm/s。
+        - 直线平滑度由 BINARY_LINE_TOLERANCE_MM 和当前 PPR 决定。
+        """
         try:
             v_max = float(self.jog_speed_input.text())
+            if getattr(self, "binary_stream_active", False):
+                self.log_error("二进制轨迹续传中，暂不追加点动；请等待当前轨迹完成或先停止")
+                return
             sx, sy = (self.point_queue[-1][0], self.point_queue[-1][1]) if self.point_queue else (self.cur_x, self.cur_y)
             if not self.check_workspace_safety(sx, sy):
                 sx, sy = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
@@ -678,18 +1170,29 @@ class ScaraMotionMixin:
                     self.log_error("点动距离过短，未生成轨迹")
                     return
                 self.preview_planned_path(path, "点动")
-                self.load_motion_queue(path, append=True)
+                moving = bool(self.waiting_for_ack or self.point_queue)
+                send_path = None if moving else self.generate_binary_line_targets((sx, sy), (tx, ty), v_max)
+                self.load_motion_queue(path, append=moving, send_path=send_path)
             else: self.log_error(f"不可达区域: X={tx:.1f}, Y={ty:.1f}")
         except Exception as e: self.log_error(f"点动错误: {e}")
     
     def motor_jog(self, motor_id, direction):
-        """
-        ???????????/????????????
-        :param motor_id: ???? (1 ? 2)
-        :param direction: ?? (1: ??, -1: ??)
+        """单电机点动。
+
+        空闲时：把单关节转动采样成若干末端点，再以二进制关节目标上传，由下位机插补。
+        队列中：保留旧的 ASCII 追加行为，避免中途打断当前运动。
+
+        参数：
+        - motor_id：1 或 2，表示点动哪个主动电机。
+        - direction：1 为正向，-1 为反向。
+        - half_turn：单次点动角度，单位 deg；需要更小步距可调低此值。
+        - num_steps：关节点采样数；调大更贴近单关节曲线，但上传点更多。
         """
         try:
-            # ???????????????????????
+            if getattr(self, "binary_stream_active", False):
+                self.log_error("二进制轨迹续传中，暂不追加电机点动；请等待当前轨迹完成或先停止")
+                return
+            # 若 ASCII 队列正在运行，则以队列尾点作为下一段起点；否则使用当前反馈/仿真坐标。
             if self.waiting_for_ack or self.point_queue:
                 sx, sy = self.point_queue[-1][0], self.point_queue[-1][1]
             else:
@@ -709,22 +1212,22 @@ class ScaraMotionMixin:
             elif motor_id == 2:
                 new_q2 = q2 + direction * half_turn
             else:
-                self.log_error(f"??????: {motor_id}")
+                self.log_error(f"未知电机编号: {motor_id}")
                 return
             
             new_x, new_y = self.kinematics.forward(new_q1, new_q2)
             if new_x is None or new_y is None:
-                self.log_error(f"??{motor_id}????????")
+                self.log_error(f"电机{motor_id}点动目标不可解")
                 return
 
             if not self.check_workspace_safety(new_x, new_y):
-                self.log_error(f"??{motor_id}?????????: X={new_x:.1f}, Y={new_y:.1f}")
+                self.log_error(f"电机{motor_id}点动目标不可达: X={new_x:.1f}, Y={new_y:.1f}")
                 return
 
             v_max = float(self.jog_speed_input.text())
-            num_steps = 20  # ??????????
+            num_steps = 20
 
-            # ---- ???????????????????? ----
+            # 按关节角度均匀采样，保证电机点动本质上是一根轴在动，而不是 XY 直线点动。
             joint_points = []
             for i in range(num_steps + 1):
                 t = i / num_steps
@@ -736,11 +1239,11 @@ class ScaraMotionMixin:
                     jq2 = q2 + t * direction * half_turn
                 px, py = self.kinematics.forward(jq1, jq2)
                 if px is None or py is None:
-                    self.log_error(f"??{motor_id}???{i}???")
+                    self.log_error(f"电机{motor_id}点动第{i}个采样点不可解")
                     return
                 joint_points.append((px, py))
 
-            # ---- ?????TCP ????? ----
+            # send_path 直接使用这组采样点；下位机会在相邻关节目标之间做 10kHz 插补。
             path = []
             for i in range(1, len(joint_points)):
                 x0, y0 = joint_points[i - 1]
@@ -748,14 +1251,15 @@ class ScaraMotionMixin:
                 path.append((x1, y1, v_max, False))
 
             if not path:
-                self.log_error("??????????????")
+                self.log_error("电机点动未生成有效轨迹")
                 return
 
-            self.preview_planned_path(path, f"??{motor_id}??")
-            self.load_motion_queue(path, append=True)
+            self.preview_planned_path(path, f"电机{motor_id}点动")
+            moving = bool(self.waiting_for_ack or self.point_queue)
+            self.load_motion_queue(path, append=moving, send_path=None if moving else path)
             self.log_display.append(
-                f"<font color='cyan'>??{motor_id} {'??' if direction > 0 else '??'}????????: ({sx:.1f},{sy:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
+                f"<font color='cyan'>电机{motor_id} {'正向' if direction > 0 else '反向'}点动: ({sx:.1f},{sy:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
             )
 
         except Exception as e:
-            self.log_error(f"??????: {e}")
+            self.log_error(f"电机点动错误: {e}")

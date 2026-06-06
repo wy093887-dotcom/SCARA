@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "board_pins.h"
 #include "app_params.h"
+#include "binary_traj.h"
 #include "gcode_stream.h"
 #include "home_controller.h"
 #include "protocol.h"
@@ -19,6 +20,7 @@ void App_Init(void)
     ScaraKinematics_Init();
     HomeController_Init();
     GcodeStream_Init();
+    BinaryTraj_Init();
     Protocol_Init();
     SerialDma_Init();
     HAL_TIM_Base_Start_IT(BOARD_TICK_TIM);
@@ -35,22 +37,31 @@ void App_Loop(void)
         Protocol_ProcessLine(line);
     }
     HomeController_Loop();
+    BinaryTraj_Loop();
     GcodeStream_Loop();
     Protocol_Loop();
 }
 
-void App_Tick1kHz(void)
+void App_Tick10kHz(void)
 {
-    Stepper_Tick1kHz();
-    HomeController_Tick1kHz();
-    GcodeStream_Tick1kHz();
-    Protocol_Tick1kHz();
+    static uint8_t low_rate_divider;
+
+    Stepper_Tick10kHz();
+    BinaryTraj_Tick10kHz();
+
+    low_rate_divider++;
+    if (low_rate_divider >= 10u) {
+        low_rate_divider = 0;
+        HomeController_Tick1kHz();
+        GcodeStream_Tick1kHz();
+        Protocol_Tick1kHz();
+    }
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim == BOARD_TICK_TIM) {
-        App_Tick1kHz();
+        App_Tick10kHz();
     }
 }
 

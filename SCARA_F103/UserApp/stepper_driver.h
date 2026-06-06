@@ -58,7 +58,7 @@ void Stepper_EStopAll(void);
 void Stepper_ClearError(void);
 void Stepper_SetErrorAll(uint32_t error_bits);
 void Stepper_Zero(void);
-void Stepper_Tick1kHz(void);
+void Stepper_Tick10kHz(void);
 bool Stepper_IsBusy(void);
 bool Stepper_CanAcceptMove(void);
 bool Stepper_TargetsAllowed(int64_t pos1, int64_t pos2);

@@ -60,11 +60,21 @@ function Send-Command {
 
     $Serial.DiscardInBuffer()
     $Serial.WriteLine($Command)
-    $response = Read-Line-Safe -Serial $Serial
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(1000, $TimeoutMs * 4))
+    $response = "<timeout>"
     $ok = $false
-    foreach ($prefix in $AcceptedPrefixes) {
-        if ($response.StartsWith($prefix)) {
-            $ok = $true
+    while ((Get-Date) -lt $deadline) {
+        $response = Read-Line-Safe -Serial $Serial
+        if ($response.StartsWith("<")) {
+            continue
+        }
+        foreach ($prefix in $AcceptedPrefixes) {
+            if ($response.StartsWith($prefix)) {
+                $ok = $true
+                break
+            }
+        }
+        if ($ok -or $response -eq "<timeout>") {
             break
         }
     }

@@ -4,6 +4,7 @@
 
 #include "app_config.h"
 #include "app_params.h"
+#include "binary_traj.h"
 #include "gcode_stream.h"
 #include "home_controller.h"
 #include "home_sensor.h"
@@ -55,7 +56,7 @@ void Protocol_SendStatus(void)
     SerialDma_SendFormat("STAT t=%lu m=%s e=%lu p=%ld,%ld "
                          "r=%u,%u en=%u,%u pps=%ld,%ld tgt=%ld,%ld wd=%u idle=%lu "
                          "rxov=%lu txd=%lu txq=%lu h=%u,%u hs=%s he=%u "
-                         "bf=%u,%u\r\n",
+                         "bf=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu\r\n",
                          (unsigned long)s.tick_ms,
                          Stepper_ModeName(s.axis[0].mode != STEPPER_MODE_IDLE ? s.axis[0].mode : s.axis[1].mode),
                          (unsigned long)(s.axis[0].error | s.axis[1].error),
@@ -79,7 +80,13 @@ void Protocol_SendStatus(void)
                          HomeController_StateName(HomeController_GetState()),
                          (unsigned int)HomeController_Error(),
                          (unsigned int)GcodeStream_PlannerFree(),
-                         (unsigned int)GcodeStream_PlannerCount());
+                         (unsigned int)GcodeStream_PlannerCount(),
+                         BinaryTraj_StateName(BinaryTraj_GetState()),
+                         (unsigned long)BinaryTraj_AcceptedCount(),
+                         (unsigned long)BinaryTraj_ExecutedCount(),
+                         (unsigned int)BinaryTraj_BufferCount(),
+                         (unsigned int)BinaryTraj_BufferFree(),
+                         (unsigned long)APP_CONTROL_HZ);
 }
 
 static void send_errors(void)
@@ -127,7 +134,8 @@ void Protocol_ProcessLine(const char *line)
     } else if (strcmp(cmd, "HOSTCAP") == 0) {
         /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
         const AppParams *p = AppParams_Get();
-        SerialDma_SendFormat("OK HOSTCAP role=pulse_executor host_plan=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
+        SerialDma_SendFormat("OK HOSTCAP role=joint_interpolator host_plan=1 host_ik=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F legacy_gcode=1 binary_traj=1 joint_interp=1 control_hz=%lu ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
+                             (unsigned long)APP_CONTROL_HZ,
                              (long)p->pulses_per_rev[0],
                              (long)p->pulses_per_rev[1]);
     } else if (strcmp(cmd, "STATUS") == 0 || strcmp(cmd, "QSTAT") == 0) {
@@ -199,10 +207,12 @@ void Protocol_ProcessLine(const char *line)
         SerialDma_Send("OK WATCHDOG OFF\r\n");
     } else if (strcmp(cmd, "STOP") == 0) {
         HomeController_Stop();
+        BinaryTraj_Stop();
         MotionPlanner_Stop();
         SerialDma_Send("OK STOP\r\n");
     } else if (strcmp(cmd, "ESTOP") == 0) {
         HomeController_Stop();
+        BinaryTraj_Stop();
         Stepper_EStopAll();
         SerialDma_Send("OK ESTOP\r\n");
     } else if (strcmp(cmd, "CLEAR_ERROR") == 0 || strcmp(cmd, "RESET") == 0) {

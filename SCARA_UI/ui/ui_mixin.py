@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QComboBox,
+    QFontComboBox,
     QLineEdit,
     QSizePolicy,
     QSlider,
@@ -25,7 +26,7 @@ class HandwritingPad(QWidget):
         super().__init__(parent)
         self._strokes = []
         self._drawing = False
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(110)
         self.setStyleSheet("background: #fafafa; border: 1px solid #888;")
 
     def normalized_strokes(self):
@@ -93,10 +94,29 @@ class ScaraUiMixin:
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        central_widget.setStyleSheet(
+            "QWidget { font-size: 9pt; } "
+            "QGroupBox { margin-top: 8px; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 2px; } "
+            "QPushButton { min-height: 22px; padding: 2px 5px; } "
+            "QLineEdit, QComboBox { min-height: 22px; }"
+        )
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
         
-        left_panel = QVBoxLayout()
-        main_layout.addLayout(left_panel, 3) 
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(200)
+        left_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        left_scroll.setStyleSheet("QScrollArea { border: none; }")
+        left_widget = QWidget()
+        left_panel = QVBoxLayout(left_widget)
+        left_panel.setContentsMargins(4, 4, 4, 4)
+        left_panel.setSpacing(5)
+        left_scroll.setWidget(left_widget)
+        main_layout.addWidget(left_scroll, 1)
 
         # 1. 串口设置
         serial_group = QGroupBox("串口设置")
@@ -123,11 +143,13 @@ class ScaraUiMixin:
         # 2. 硬件控制
         hw_group = QGroupBox("硬件控制")
         hw_layout = QGridLayout()
-        box_w, box_h = 150, 28
+        # box_w/box_h 控制左侧输入控件尺寸；屏幕放不下时优先调小这里或依靠滚动区。
+        box_w, box_h = 120, 24
         hw_layout.addWidget(QLabel("脉冲/圈(需与驱动拨码一致):"), 0, 0)
         self.microstep_combo = QComboBox()
         self.microstep_combo.addItems(["400", "1600", "3200", "6400"])
-        self.microstep_combo.setCurrentText("1600")
+        # 默认 3200PPR：用于降低脉冲量化误差。若驱动器拨码不是 3200，必须同步修改。
+        self.microstep_combo.setCurrentText("3200")
         self.microstep_combo.setFixedSize(box_w, box_h)
         self.microstep_combo.currentTextChanged.connect(self.on_microstep_changed)
         hw_layout.addWidget(self.microstep_combo, 0, 1, Qt.AlignLeft)
@@ -141,10 +163,10 @@ class ScaraUiMixin:
         # 3. 方向点动
         jog_group = QGroupBox("方向点动")
         jog_grid = QGridLayout()
-        jog_grid.setSpacing(6)  # ?????
+        jog_grid.setSpacing(4)  # ?????
         self.btns = {"UP": QPushButton("前进"), "DOWN": QPushButton("后退"), "LEFT": QPushButton("左移"), "RIGHT": QPushButton("右移")}
         for b in self.btns.values(): 
-            b.setFixedSize(100, 30)
+            b.setFixedSize(82, 24)
         
         # 电机单独控制按钮（四个角）
         self.motor_btns = {
@@ -154,8 +176,8 @@ class ScaraUiMixin:
             "M2_NEG": QPushButton("M2-"),  # 电机2逆向旋转
         }
         for b in self.motor_btns.values():
-            b.setFixedSize(100, 30)  # 与前后左右方向按钮等大
             b.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold;")
+            b.setFixedSize(82, 24)  # 与前后左右方向按钮等大
         
         # 布局：四个角放置电机控制按钮，中心放置方向点动按钮
         jog_grid.addWidget(self.motor_btns["M1_POS"], 0, 0)  # 左上角 - 电机1正向
@@ -168,7 +190,8 @@ class ScaraUiMixin:
         jog_grid.addWidget(self.btns["RIGHT"], 1, 2)
         jog_grid.addWidget(self.btns["DOWN"], 2, 1)
         self.jog_speed_input = QLineEdit("30.0")
-        self.jog_speed_input.setFixedSize(100, 30)
+        # 点动速度单位 mm/s。点动抖动时先降低速度，再检查 PPR 和 BINARY_LINE_TOLERANCE_MM。
+        self.jog_speed_input.setFixedSize(82, 24)
         self.jog_speed_input.setAlignment(Qt.AlignCenter)
         jog_grid.addWidget(self.jog_speed_input, 1, 1)
         jog_group.setLayout(jog_grid)
@@ -244,6 +267,39 @@ class ScaraUiMixin:
         btn_text_fzu.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
         btn_text_fzu.clicked.connect(lambda: self.plan_fixed_text_path("FZU"))
         ft_grid.addWidget(btn_text_fzu, 3, 1)
+
+        btn_text_fdu.setText("福州大学")
+        try:
+            btn_text_fdu.clicked.disconnect()
+        except TypeError:
+            pass
+        btn_text_fdu.clicked.connect(lambda: self.plan_fixed_text_path("福州大学"))
+
+        ft_grid.addWidget(QLabel("空心字:"), 4, 0)
+        self.text_outline_input = QLineEdit("福州大学")
+        self.text_outline_input.setFixedHeight(box_h)
+        ft_grid.addWidget(self.text_outline_input, 4, 1)
+
+        ft_grid.addWidget(QLabel("字体:"), 5, 0)
+        self.text_font_combo = QFontComboBox()
+        self.text_font_combo.setFixedHeight(box_h)
+        self.text_font_combo.setCurrentFont(QFont("Microsoft YaHei", 9))
+        ft_grid.addWidget(self.text_font_combo, 5, 1)
+
+        ft_grid.addWidget(QLabel("高度(mm):"), 6, 0)
+        self.text_height_input = QLineEdit("80.0")
+        self.text_height_input.setFixedSize(box_w, box_h)
+        ft_grid.addWidget(self.text_height_input, 6, 1)
+
+        btn_text_preview = QPushButton("预览空心字")
+        btn_text_preview.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold;")
+        btn_text_preview.clicked.connect(self.preview_text_outline_path)
+        ft_grid.addWidget(btn_text_preview, 7, 0)
+
+        btn_text_run = QPushButton("运行空心字")
+        btn_text_run.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
+        btn_text_run.clicked.connect(self.plan_text_outline_path)
+        ft_grid.addWidget(btn_text_run, 7, 1)
         
         ft_group.setLayout(ft_grid)
         left_panel.addWidget(ft_group)
@@ -271,12 +327,15 @@ class ScaraUiMixin:
         mid_scroll = QScrollArea()
         mid_scroll.setWidgetResizable(True)
         mid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        mid_scroll.setMinimumWidth(200)
+        mid_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         mid_scroll.setStyleSheet("QScrollArea { border: none; }")
         mid_widget = QWidget()
         mid_panel = QVBoxLayout(mid_widget)
+        mid_panel.setContentsMargins(4, 4, 4, 4)
         mid_panel.setSpacing(6)
         mid_scroll.setWidget(mid_widget)
-        main_layout.addWidget(mid_scroll, 3)
+        main_layout.addWidget(mid_scroll, 1)
         
         coord_group = QGroupBox("实时坐标")
         c_lay = QVBoxLayout()
@@ -287,8 +346,11 @@ class ScaraUiMixin:
         self.feedback_pose_label = QLabel("回传末端: X=--, Y=--")
         self.feedback_joint_label = QLabel("回传角度: M1=-- deg, M2=-- deg")
         self.feedback_pulse_label = QLabel("脉冲/PPS: P=--,--  A1=--/--  A2=--/--")
-        for label in (self.feedback_pose_label, self.feedback_joint_label, self.feedback_pulse_label):
+        self.feedback_error_label = QLabel("XY误差: 当前 dX=--, dY=--, |e|=-- mm\nMaxX/MaxY --/-- mm  RMSX/RMSY --/-- mm")
+        for label in (self.feedback_pose_label, self.feedback_joint_label, self.feedback_pulse_label, self.feedback_error_label):
             label.setAlignment(Qt.AlignCenter)
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             label.setStyleSheet("color: #cccccc;")
             c_lay.addWidget(label)
         coord_group.setLayout(c_lay)
@@ -303,14 +365,23 @@ class ScaraUiMixin:
         self.lbl_mcu_tick = QLabel("MCU时间: 0 ms")
         self.lbl_mcu_gbuf = QLabel("缓冲区占用: 0 / 32")
         self.lbl_mcu_queue = QLabel("队列负载(Q): 0")
+        self.lbl_mcu_interp = QLabel("插补: --  已执行 0/0  队列 0")
+        self.lbl_mcu_hz = QLabel("控制频率: -- Hz")
+        for label in (self.lbl_mcu_err, self.lbl_mcu_tick, self.lbl_mcu_gbuf, self.lbl_mcu_queue, self.lbl_mcu_interp, self.lbl_mcu_hz):
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_mcu_err.setStyleSheet("font-weight: bold; color: #e06c75;")
         self.lbl_mcu_tick.setStyleSheet("color: #61afef;")
         self.lbl_mcu_gbuf.setStyleSheet("color: #98c379;")
         self.lbl_mcu_queue.setStyleSheet("color: #d19a66;")
+        self.lbl_mcu_interp.setStyleSheet("color: #c678dd;")
+        self.lbl_mcu_hz.setStyleSheet("color: #56b6c2;")
         mcu_status_lay.addWidget(self.lbl_mcu_err, 0, 0)
         mcu_status_lay.addWidget(self.lbl_mcu_tick, 0, 1)
         mcu_status_lay.addWidget(self.lbl_mcu_gbuf, 1, 0)
         mcu_status_lay.addWidget(self.lbl_mcu_queue, 1, 1)
+        mcu_status_lay.addWidget(self.lbl_mcu_interp, 2, 0)
+        mcu_status_lay.addWidget(self.lbl_mcu_hz, 2, 1)
         mcu_status_group.setLayout(mcu_status_lay)
         mid_panel.addWidget(mcu_status_group)
         
@@ -411,8 +482,8 @@ class ScaraUiMixin:
         self.btn_emergency_stop = QPushButton("🛑 紧急停止")
         self.btn_emergency_stop.setText("\u6025\u505c (\u4fdd\u7559\u961f\u5217)")
         self.btn_stop_motion = QPushButton("\u505c\u6b62 (\u6e05\u9664\u961f\u5217)")
-        self.btn_stop_motion.setFixedHeight(38)
-        self.btn_emergency_stop.setFixedHeight(45)
+        self.btn_stop_motion.setFixedHeight(32)
+        self.btn_emergency_stop.setFixedHeight(34)
         self.btn_stop_motion.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold;")
         self.btn_emergency_stop.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
         task_lay.addWidget(self.btn_reset_home)
@@ -426,10 +497,15 @@ class ScaraUiMixin:
         self.btn_emergency_stop.clicked.connect(self.emergency_stop)
 
         # 右侧面板
-        right_panel = QVBoxLayout()
+        right_widget = QWidget()
+        # 右侧仿真列固定宽度；窗口拉伸时只让左/中控制列变化。
+        # 若显示器较窄，可把 720 调小到 640；若希望更大仿真图，可调到 800。
+        right_widget.setFixedWidth(720)
+        right_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        right_panel = QVBoxLayout(right_widget)
         right_panel.setContentsMargins(0, 0, 0, 0)
         right_panel.setSpacing(4)
-        main_layout.addLayout(right_panel, 4)
+        main_layout.addWidget(right_widget, 0)
         self.fig = Figure(figsize=(8, 5))
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -458,6 +534,7 @@ class ScaraUiMixin:
         log_v.addWidget(QLabel("通讯指令记录:"))
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
+        self.log_display.document().setMaximumBlockCount(1200)
         self.log_display.setStyleSheet("background: #1e1e1e; color: #61afef; font-family: Consolas;")
         log_v.addWidget(self.log_display)
         self.btn_clear_log = QPushButton("清空发送数据")
