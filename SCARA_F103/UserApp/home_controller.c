@@ -3,8 +3,11 @@
 /* 回零状态机：保留给后续接限位开关使用，课程通信测试可暂时不依赖它。 */
 
 #include "app_config.h"
+#include "app_params.h"
 #include "home_sensor.h"
 #include "stepper_driver.h"
+
+#define HOME_MRAD_PER_REV_I 6283LL
 
 typedef enum {
     HOME_ERR_NONE = 0,
@@ -17,18 +20,36 @@ static HomeControllerState s_state;
 static uint32_t s_elapsed_ms;
 static uint16_t s_debounce_ms;
 static uint8_t s_error;
-static uint8_t s_backoff_started;
+static uint8_t s_move_started;
+static bool s_simulated;
 
 static int32_t axis_search_pps(uint32_t axis)
 {
+    // Axis1 左红臂：正方向应对应角度增大。若红臂从 90° 向 180° 左水平运动，
+    // APP_HOME_AXIS1_DIR 应配置为 +1。
+    //
+    // Axis2 右蓝臂：若从 90° 向 0° 右水平运动，
+    // APP_HOME_AXIS2_DIR 应配置为 -1。
     int32_t dir = axis == 0u ? APP_HOME_AXIS1_DIR : APP_HOME_AXIS2_DIR;
     return dir >= 0 ? APP_HOME_SEARCH_PPS : -APP_HOME_SEARCH_PPS;
 }
 
-static int64_t axis_backoff_delta(uint32_t axis)
+static int64_t axis_reference_pulse(uint32_t axis, int32_t mrad)
 {
-    int32_t dir = axis == 0u ? APP_HOME_AXIS1_DIR : APP_HOME_AXIS2_DIR;
-    return dir >= 0 ? -(int64_t)APP_HOME_BACKOFF_PULSE : (int64_t)APP_HOME_BACKOFF_PULSE;
+    const AppParams *p = AppParams_Get();
+    int64_t scale = (int64_t)p->pulses_per_rev[axis] * (int64_t)p->reducer_ratio[axis];
+    int64_t delta = (int64_t)mrad - (int64_t)p->motor_zero_mrad[axis];
+    return (delta * (int64_t)p->motor_dir_sign[axis] * scale) / HOME_MRAD_PER_REV_I;
+}
+
+static int64_t axis_horizontal_pulse(uint32_t axis)
+{
+    return axis_reference_pulse(axis, axis == 0u ? APP_HOME_AXIS1_HORIZONTAL_MRAD : APP_HOME_AXIS2_HORIZONTAL_MRAD);
+}
+
+static int64_t axis_vertical_pulse(uint32_t axis)
+{
+    return axis_reference_pulse(axis, axis == 0u ? APP_HOME_AXIS1_VERTICAL_MRAD : APP_HOME_AXIS2_VERTICAL_MRAD);
 }
 
 static void enter_state(HomeControllerState state)
@@ -36,7 +57,7 @@ static void enter_state(HomeControllerState state)
     s_state = state;
     s_elapsed_ms = 0;
     s_debounce_ms = 0;
-    s_backoff_started = 0;
+    s_move_started = 0;
 }
 
 static bool sensor_active(uint32_t axis)
@@ -58,16 +79,16 @@ static bool debounce_axis(uint32_t axis)
     return false;
 }
 
-static bool start_backoff(uint32_t axis)
+static bool start_axis_move_to(uint32_t axis, int64_t target)
 {
     StepperState stepper;
     Stepper_GetStateSnapshot(&stepper);
     int64_t p1 = stepper.axis[0].position_pulse;
     int64_t p2 = stepper.axis[1].position_pulse;
     if (axis == 0u) {
-        p1 += axis_backoff_delta(0);
+        p1 = target;
     } else {
-        p2 += axis_backoff_delta(1);
+        p2 = target;
     }
     return Stepper_MoveAbs(p1, p2, APP_HOME_SEARCH_PPS, APP_HOME_SEARCH_PPS);
 }
@@ -78,25 +99,28 @@ void HomeController_Init(void)
     s_elapsed_ms = 0;
     s_debounce_ms = 0;
     s_error = HOME_ERR_NONE;
-    s_backoff_started = 0;
+    s_move_started = 0;
+    s_simulated = false;
 }
 
-bool HomeController_Start(void)
+bool HomeController_Start(bool simulated)
 {
     if (s_state == HOME_CTRL_DONE || s_state == HOME_CTRL_ERROR) {
         enter_state(HOME_CTRL_IDLE);
         s_error = HOME_ERR_NONE;
     }
 
-    if (Stepper_IsBusy() || s_state == HOME_CTRL_AXIS1_SEARCH || s_state == HOME_CTRL_AXIS1_BACKOFF ||
-        s_state == HOME_CTRL_AXIS2_SEARCH || s_state == HOME_CTRL_AXIS2_BACKOFF ||
-        s_state == HOME_CTRL_SET_ZERO) {
+    if (Stepper_IsBusy() || s_state == HOME_CTRL_AXIS1_SEARCH || s_state == HOME_CTRL_AXIS1_RETURN ||
+        s_state == HOME_CTRL_AXIS2_SEARCH || s_state == HOME_CTRL_AXIS2_RETURN) {
         s_error = HOME_ERR_BUSY;
         return false;
     }
     Stepper_ClearError();
     Stepper_EnableAll(true);
-    Stepper_SetPps(STEPPER_AXIS_1, axis_search_pps(0));
+    s_simulated = simulated;
+    if (!s_simulated) {
+        Stepper_SetPps(STEPPER_AXIS_1, axis_search_pps(0));
+    }
     s_error = HOME_ERR_NONE;
     enter_state(HOME_CTRL_AXIS1_SEARCH);
     return true;
@@ -133,41 +157,64 @@ void HomeController_Loop(void)
     }
 
     if (s_state == HOME_CTRL_AXIS1_SEARCH) {
-        if (debounce_axis(0)) {
-            Stepper_Stop(STEPPER_AXIS_1);
-            enter_state(HOME_CTRL_AXIS1_BACKOFF);
-        }
-    } else if (s_state == HOME_CTRL_AXIS1_BACKOFF) {
-        if (!s_backoff_started && Stepper_CanAcceptMove()) {
-            if (!start_backoff(0)) {
+        if (s_simulated && !s_move_started && Stepper_CanAcceptMove()) {
+            if (!start_axis_move_to(0, axis_horizontal_pulse(0))) {
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
             }
-            s_backoff_started = 1;
-        } else if (s_backoff_started && Stepper_CanAcceptMove()) {
-            Stepper_SetPps(STEPPER_AXIS_2, axis_search_pps(1));
-            enter_state(HOME_CTRL_AXIS2_SEARCH);
+            s_move_started = 1;
+        } else if ((s_simulated && s_move_started && Stepper_CanAcceptMove()) ||
+                   (!s_simulated && debounce_axis(0))) {
+            Stepper_Stop(STEPPER_AXIS_1);
+            enter_state(HOME_CTRL_AXIS1_RETURN);
+        }
+    } else if (s_state == HOME_CTRL_AXIS1_RETURN) {
+        if (!s_move_started && Stepper_CanAcceptMove()) {
+            if (!s_simulated) {
+                Stepper_SetPosition(STEPPER_AXIS_1, axis_horizontal_pulse(0));
+            }
+            if (!start_axis_move_to(0, axis_vertical_pulse(0))) {
+                enter_state(HOME_CTRL_ERROR);
+                s_error = HOME_ERR_MOVE;
+                return;
+            }
+            s_move_started = 1;
+        } else if (s_move_started && Stepper_CanAcceptMove()) {
+            if (s_simulated) {
+                enter_state(HOME_CTRL_AXIS2_SEARCH);
+            } else {
+                Stepper_SetPps(STEPPER_AXIS_2, axis_search_pps(1));
+                enter_state(HOME_CTRL_AXIS2_SEARCH);
+            }
         }
     } else if (s_state == HOME_CTRL_AXIS2_SEARCH) {
-        if (debounce_axis(1)) {
-            Stepper_Stop(STEPPER_AXIS_2);
-            enter_state(HOME_CTRL_AXIS2_BACKOFF);
-        }
-    } else if (s_state == HOME_CTRL_AXIS2_BACKOFF) {
-        if (!s_backoff_started && Stepper_CanAcceptMove()) {
-            if (!start_backoff(1)) {
+        if (s_simulated && !s_move_started && Stepper_CanAcceptMove()) {
+            if (!start_axis_move_to(1, axis_horizontal_pulse(1))) {
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
             }
-            s_backoff_started = 1;
-        } else if (s_backoff_started && Stepper_CanAcceptMove()) {
-            enter_state(HOME_CTRL_SET_ZERO);
+            s_move_started = 1;
+        } else if ((s_simulated && s_move_started && Stepper_CanAcceptMove()) ||
+                   (!s_simulated && debounce_axis(1))) {
+            Stepper_Stop(STEPPER_AXIS_2);
+            enter_state(HOME_CTRL_AXIS2_RETURN);
         }
-    } else if (s_state == HOME_CTRL_SET_ZERO) {
-        Stepper_Zero();
-        enter_state(HOME_CTRL_DONE);
+    } else if (s_state == HOME_CTRL_AXIS2_RETURN) {
+        if (!s_move_started && Stepper_CanAcceptMove()) {
+            if (!s_simulated) {
+                Stepper_SetPosition(STEPPER_AXIS_2, axis_horizontal_pulse(1));
+            }
+            if (!start_axis_move_to(1, axis_vertical_pulse(1))) {
+                enter_state(HOME_CTRL_ERROR);
+                s_error = HOME_ERR_MOVE;
+                return;
+            }
+            s_move_started = 1;
+        } else if (s_move_started && Stepper_CanAcceptMove()) {
+            enter_state(HOME_CTRL_DONE);
+        }
     }
 }
 
@@ -196,10 +243,9 @@ const char *HomeController_StateName(HomeControllerState state)
     switch (state) {
     case HOME_CTRL_IDLE: return "Idle";
     case HOME_CTRL_AXIS1_SEARCH: return "Axis1Search";
-    case HOME_CTRL_AXIS1_BACKOFF: return "Axis1Backoff";
+    case HOME_CTRL_AXIS1_RETURN: return "Axis1Return";
     case HOME_CTRL_AXIS2_SEARCH: return "Axis2Search";
-    case HOME_CTRL_AXIS2_BACKOFF: return "Axis2Backoff";
-    case HOME_CTRL_SET_ZERO: return "SetZero";
+    case HOME_CTRL_AXIS2_RETURN: return "Axis2Return";
     case HOME_CTRL_DONE: return "Done";
     case HOME_CTRL_ERROR: return "Error";
     default: return "Unknown";

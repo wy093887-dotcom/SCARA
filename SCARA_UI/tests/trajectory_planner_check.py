@@ -127,7 +127,8 @@ def point_line_error(px, py, ax, ay, bx, by):
 def max_joint_linearized_line_error(ui, start, targets, ppr=3200):
     prev_pulse = binary_mod.joint_deg_to_pulse(*ui.kinematics.inverse(*start), ppr)
     max_error = 0.0
-    for x, y, _feed, _silent in targets:
+    for target in targets:
+        x, y = target[0], target[1]
         pulse = binary_mod.joint_deg_to_pulse(*ui.kinematics.inverse(x, y), ppr)
         steps = max(abs(pulse[0] - prev_pulse[0]), abs(pulse[1] - prev_pulse[1]), 1)
         for index in range(1, steps + 1):
@@ -145,8 +146,15 @@ def max_joint_linearized_line_error(ui, start, targets, ppr=3200):
 def max_joint_path_error(ui, start, targets, expected_path, ppr=3200):
     prev_pulse = binary_mod.joint_deg_to_pulse(*ui.kinematics.inverse(*start), ppr)
     expected = [(float(p[0]), float(p[1])) for p in expected_path]
+    expanded = []
+    cursor = (float(start[0]), float(start[1]))
+    for target in targets:
+        x, y = float(target[0]), float(target[1])
+        flags = int(target[4]) if len(target) > 4 else 0
+        expanded.append((x, y))
+        cursor = (x, y)
     max_error = 0.0
-    for x, y, _feed, _silent in targets:
+    for x, y in expanded:
         pulse = binary_mod.joint_deg_to_pulse(*ui.kinematics.inverse(x, y), ppr)
         steps = max(abs(pulse[0] - prev_pulse[0]), abs(pulse[1] - prev_pulse[1]), 1)
         for index in range(1, steps + 1):
@@ -216,18 +224,22 @@ def main():
     assert_no_mid_speed_drop(ccw, "G3")
     line_send = ui.generate_binary_line_targets((75.0, 220.0), (150.0, 250.0), 20.0)
     arc_send = ui.generate_binary_arc_targets((75.0, 220.0), (150.0, 250.0), 60.0, True, 20.0)
-    assert_true(2 <= len(line_send) < len(line) // 4, f"G1 binary keypoints not adaptive/compact: send={len(line_send)} preview={len(line)}")
-    assert_true(max_joint_linearized_line_error(ui, (75.0, 220.0), line_send) <= 0.5, "G1 binary line exceeds 0.5mm offline error")
+    assert_true(len(line_send) == 1, f"G1 binary line should upload endpoint only: send={len(line_send)}")
+    assert_true(line_send[0][0] == 150.0 and line_send[0][1] == 250.0, "G1 binary endpoint changed")
+    assert_true((line_send[0][4] & ui.BINARY_FLAG_EXACT_STOP) != 0, "G1 endpoint is not exact-stop")
     assert_true(8 <= len(arc_send) < len(cw) // 2, f"G2 binary arc keypoints not compact: send={len(arc_send)} preview={len(cw)}")
     joint_points = binary_mod.path_to_joint_points(line_send, ui.kinematics, 3200, start_xy=(75.0, 220.0))
     assert_true(len(joint_points) == len(line_send), "G1 binary joint conversion changed keypoint count")
+    assert_true((joint_points[0].flags & binary_mod.FLAG_EXACT_STOP) != 0, "G1 exact-stop flag lost during joint conversion")
     assert_true(all(16 <= point.v_dom_pps <= 10000 for point in joint_points), "G1 v_dom out of range")
     assert_true(car1_preview and car1_send, "car1 geometry motion did not produce binary send path")
     assert_true(car2_preview and car2_send, "car2 geometry motion did not produce binary send path")
     assert_true(car1_send[0][3] is True and car1_send[0][1] < 220.0, "car1 missing silent connector to shape start")
     assert_true(car2_send[0][3] is True and car2_send[0][1] < 220.0, "car2 missing silent connector to shape start")
-    assert_true(max_joint_path_error(ui, (75.0, 220.0), car1_send, car1_preview) <= 0.5, "car1 binary joint path exceeds 0.5mm offline error")
-    assert_true(max_joint_path_error(ui, (75.0, 220.0), car2_send, car2_preview) <= 0.5, "car2 binary joint path exceeds 0.5mm offline error")
+    assert_true(any((point[4] & binary_mod.FLAG_CARTESIAN_LINE) != 0 for point in car1_send), "car1 has no endpoint-style line blocks")
+    assert_true(any((point[4] & binary_mod.FLAG_CARTESIAN_LINE) != 0 for point in car2_send), "car2 has no endpoint-style line blocks")
+    assert_true(all((point[4] & ui.BINARY_FLAG_EXACT_STOP) != 0 for point in car1_send if point[4] & ui.BINARY_FLAG_CARTESIAN_LINE), "car1 line endpoints are not exact-stop")
+    assert_true(all((point[4] & ui.BINARY_FLAG_EXACT_STOP) != 0 for point in car2_send if point[4] & ui.BINARY_FLAG_CARTESIAN_LINE), "car2 line endpoints are not exact-stop")
     assert_true(len(car1_send) < len(car1_preview) // 5, f"car1 binary path was not simplified: send={len(car1_send)} preview={len(car1_preview)}")
     assert_true(len(car2_send) < len(car2_preview) // 5, f"car2 binary path was not simplified: send={len(car2_send)} preview={len(car2_preview)}")
     assert_true(len(binary_mod.path_to_joint_points(car1_send, ui.kinematics, 3200, start_xy=(75.0, 220.0))) <= 3000, "car1 binary upload exceeds stress target size")

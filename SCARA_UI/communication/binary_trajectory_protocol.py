@@ -30,6 +30,8 @@ TYPE_STATUS_RSP = 0x82
 
 MRAD_PER_REV = 6283
 DEFAULT_ZERO_MRAD = (2251, 890)
+FLAG_EXACT_STOP = 0x0001
+FLAG_CARTESIAN_LINE = 0x0002
 
 
 @dataclass
@@ -145,7 +147,9 @@ def path_to_joint_points(
             raise ValueError(f"unreachable start point: X={sx:.3f}, Y={sy:.3f}")
         prev_pulse = joint_deg_to_pulse(q1, q2, ppr)
         prev_xy = (sx, sy)
-    for x, y, feed_mm_min, _silent in path:
+    for point in path:
+        x, y, feed_mm_min = point[0], point[1], point[2]
+        flags = int(point[4]) if len(point) > 4 else 0
         x = float(x)
         y = float(y)
         feed_mm_min = float(feed_mm_min)
@@ -153,6 +157,14 @@ def path_to_joint_points(
         if q1 is None or q2 is None:
             raise ValueError(f"unreachable path point: X={x:.3f}, Y={y:.3f}")
         p1, p2 = joint_deg_to_pulse(q1, q2, ppr)
+        if flags & FLAG_CARTESIAN_LINE:
+            base = float(getattr(getattr(kinematics, "config", None), "base_distance", 0.0))
+            x_um = int(round((x - base * 0.5) * 1000.0))
+            y_um = int(round(y * 1000.0))
+            result.append(BinaryJointPoint(x_um, y_um, max(1, min(65535, int(round(feed_mm_min)))), flags=flags))
+            prev_pulse = (p1, p2)
+            prev_xy = (x, y)
+            continue
         if prev_pulse is None:
             v_dom = max(min_pps, min(max_pps, int(feed_mm_min / 60.0 * 30.0)))
         else:
@@ -173,7 +185,7 @@ def path_to_joint_points(
             else:
                 v_dom = int(max(dom, 1) * 20)
             v_dom = max(min_pps, min(max_pps, v_dom))
-        result.append(BinaryJointPoint(p1, p2, v_dom))
+        result.append(BinaryJointPoint(p1, p2, v_dom, flags=flags))
         prev_pulse = (p1, p2)
         prev_xy = (x, y)
     return result

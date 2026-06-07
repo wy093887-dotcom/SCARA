@@ -637,7 +637,15 @@ bool GcodeStream_TryProcessLine(const char *line)
             Stepper_ClearError();
             send_ok_for_line(line);
         } else if (cmd == 'H') {
-            if (HomeController_Start()) {
+            const char *home_args = line;
+            while (*home_args != '\0' && !isspace((unsigned char)*home_args)) {
+                home_args++;
+            }
+            while (*home_args != '\0' && isspace((unsigned char)*home_args)) {
+                home_args++;
+            }
+            bool simulated = (toupper((unsigned char)home_args[0]) == 'S');
+            if (HomeController_Start(simulated)) {
                 send_ok_for_line(line);
             } else {
                 send_error(5);

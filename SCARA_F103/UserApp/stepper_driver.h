@@ -57,6 +57,7 @@ void Stepper_StopAll(void);
 void Stepper_EStopAll(void);
 void Stepper_ClearError(void);
 void Stepper_SetErrorAll(uint32_t error_bits);
+void Stepper_SetPosition(StepperAxis axis, int64_t position_pulse);
 void Stepper_Zero(void);
 void Stepper_Tick10kHz(void);
 bool Stepper_IsBusy(void);

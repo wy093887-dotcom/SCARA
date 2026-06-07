@@ -7,16 +7,15 @@
 typedef enum {
     HOME_CTRL_IDLE = 0,
     HOME_CTRL_AXIS1_SEARCH,
-    HOME_CTRL_AXIS1_BACKOFF,
+    HOME_CTRL_AXIS1_RETURN,
     HOME_CTRL_AXIS2_SEARCH,
-    HOME_CTRL_AXIS2_BACKOFF,
-    HOME_CTRL_SET_ZERO,
+    HOME_CTRL_AXIS2_RETURN,
     HOME_CTRL_DONE,
     HOME_CTRL_ERROR
 } HomeControllerState;
 
 void HomeController_Init(void);
-bool HomeController_Start(void);
+bool HomeController_Start(bool simulated);
 void HomeController_Stop(void);
 void HomeController_ClearError(void);
 void HomeController_Loop(void);

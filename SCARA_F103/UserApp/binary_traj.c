@@ -2,6 +2,7 @@
 
 #include "app_config.h"
 #include "motion_planner.h"
+#include "scara_kinematics.h"
 #include "serial_dma.h"
 #include "stepper_driver.h"
 #include "stm32f1xx_hal.h"
@@ -31,6 +32,9 @@
 #define BT_ERR_BAD_STATE 4u
 #define BT_ERR_NO_SPACE 5u
 #define BT_ERR_MOTION 6u
+
+#define BT_POINT_FLAG_EXACT_STOP 0x0001u
+#define BT_POINT_FLAG_CARTESIAN_LINE 0x0002u
 
 typedef struct {
     int32_t p1_abs;
@@ -62,6 +66,19 @@ static uint32_t s_last_dispatch_tick;
 static uint32_t s_max_dispatch_gap_ticks;
 static uint32_t s_stream_underrun_ticks;
 static uint16_t s_min_buffer_count;
+
+typedef struct {
+    bool active;
+    int32_t start_x_um;
+    int32_t start_y_um;
+    int32_t end_x_um;
+    int32_t end_y_um;
+    int32_t total_um;
+    int32_t target_um;
+    uint16_t feed_mm_min;
+} BinaryCartLine;
+
+static BinaryCartLine s_cart_line;
 
 static ParserState s_parser_state;
 static uint8_t s_header[6];
@@ -158,6 +175,45 @@ static uint16_t abs_i32_to_u16(int32_t value)
     return (uint16_t)out;
 }
 
+static int64_t i64_abs_local(int64_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static int32_t i32_isqrt_i64(int64_t value)
+{
+    if (value <= 0) {
+        return 0;
+    }
+    uint64_t op = (uint64_t)value;
+    uint64_t res = 0;
+    uint64_t one = 1ull << 62;
+    while (one > op) {
+        one >>= 2;
+    }
+    while (one != 0) {
+        if (op >= res + one) {
+            op -= res + one;
+            res = (res >> 1) + one;
+        } else {
+            res >>= 1;
+        }
+        one >>= 2;
+    }
+    return res > 2147483647ull ? 2147483647L : (int32_t)res;
+}
+
+static int32_t clamp_pps_i32(int32_t value)
+{
+    if (value < APP_MIN_EFFECTIVE_PPS) {
+        return APP_MIN_EFFECTIVE_PPS;
+    }
+    if (value > APP_MAX_PPS_DEFAULT) {
+        return APP_MAX_PPS_DEFAULT;
+    }
+    return value;
+}
+
 static uint16_t buffer_free(void)
 {
     return (uint16_t)(APP_BINARY_TRAJ_POINTS - s_count);
@@ -169,6 +225,7 @@ static void clear_queue(void)
     s_head = 0;
     s_tail = 0;
     s_count = 0;
+    s_cart_line.active = false;
     irq_restore(primask);
 }
 
@@ -274,6 +331,14 @@ static bool decode_point(const uint8_t *payload, BinaryTrajPoint *point)
 
 static bool point_allowed(const BinaryTrajPoint *point)
 {
+    if ((point->flags & BT_POINT_FLAG_CARTESIAN_LINE) != 0u) {
+        ScaraJoint joint;
+        int64_t p1 = 0;
+        int64_t p2 = 0;
+        return ScaraKinematics_InverseUm(point->p1_abs, point->p2_abs, &joint) &&
+               ScaraKinematics_JointToPulse(joint.theta1_mrad, joint.theta2_mrad, &p1, &p2) &&
+               Stepper_TargetsAllowed(p1, p2);
+    }
     return Stepper_TargetsAllowed(point->p1_abs, point->p2_abs);
 }
 
@@ -369,6 +434,148 @@ void BinaryTraj_Stop(void)
     s_state = BINARY_TRAJ_STATE_IDLE;
 }
 
+static bool current_xy_um(int32_t *x_um, int32_t *y_um)
+{
+    StepperState snapshot;
+    ScaraJoint joint;
+    ScaraPose pose;
+    Stepper_GetStateSnapshot(&snapshot);
+    if (!ScaraKinematics_PulseToJoint(snapshot.axis[0].position_pulse,
+                                      snapshot.axis[1].position_pulse,
+                                      &joint) ||
+        !ScaraKinematics_Forward(&joint, &pose)) {
+        return false;
+    }
+    *x_um = pose.x_um;
+    *y_um = pose.y_um;
+    return true;
+}
+
+static bool xy_to_pulse(int32_t x_um, int32_t y_um, int64_t *p1, int64_t *p2)
+{
+    ScaraJoint joint;
+    return ScaraKinematics_InverseUm(x_um, y_um, &joint) &&
+           ScaraKinematics_JointToPulse(joint.theta1_mrad, joint.theta2_mrad, p1, p2);
+}
+
+static void discard_current_point(void)
+{
+    uint32_t primask = irq_save();
+    s_tail = next_index(s_tail);
+    s_count--;
+    s_executed_count++;
+    if (s_last_dispatch_tick != 0u) {
+        uint32_t gap = s_tick10khz - s_last_dispatch_tick;
+        if (gap > s_max_dispatch_gap_ticks) {
+            s_max_dispatch_gap_ticks = gap;
+        }
+    }
+    s_last_dispatch_tick = s_tick10khz;
+    irq_restore(primask);
+}
+
+static bool cart_line_ready_for_next(void)
+{
+    StepperState snapshot;
+    Stepper_GetStateSnapshot(&snapshot);
+    if (snapshot.axis[0].mode == STEPPER_MODE_ESTOP || snapshot.axis[1].mode == STEPPER_MODE_ESTOP) {
+        return false;
+    }
+    if (!Stepper_IsBusy()) {
+        return true;
+    }
+    int64_t r1 = snapshot.axis[0].remaining_pulse;
+    int64_t r2 = snapshot.axis[1].remaining_pulse;
+    return r1 <= 8 && r2 <= 8;
+}
+
+static bool start_cart_line_segment(int32_t x_um, int32_t y_um, int32_t distance_um, uint16_t feed_mm_min, bool final_segment)
+{
+    StepperState snapshot;
+    int64_t p1 = 0;
+    int64_t p2 = 0;
+    if (!xy_to_pulse(x_um, y_um, &p1, &p2) || !Stepper_TargetsAllowed(p1, p2)) {
+        return false;
+    }
+    Stepper_GetStateSnapshot(&snapshot);
+    int64_t dp1 = p1 - snapshot.axis[0].position_pulse;
+    int64_t dp2 = p2 - snapshot.axis[1].position_pulse;
+    if (distance_um < 1) {
+        distance_um = 1;
+    }
+    int32_t v1 = 0;
+    int32_t v2 = 0;
+    if (dp1 != 0) {
+        int64_t n1 = i64_abs_local(dp1) * (int64_t)feed_mm_min * 50;
+        v1 = clamp_pps_i32((int32_t)(n1 / ((int64_t)distance_um * 3)));
+    }
+    if (dp2 != 0) {
+        int64_t n2 = i64_abs_local(dp2) * (int64_t)feed_mm_min * 50;
+        v2 = clamp_pps_i32((int32_t)(n2 / ((int64_t)distance_um * 3)));
+    }
+    int32_t exit1 = final_segment ? 0 : v1;
+    int32_t exit2 = final_segment ? 0 : v2;
+    return MotionPlanner_MoveAbsBlend(p1, p2, v1, v2, exit1, exit2);
+}
+
+static bool service_cartesian_line_10khz(BinaryTrajPoint *point)
+{
+    if ((point->flags & BT_POINT_FLAG_CARTESIAN_LINE) == 0u) {
+        return false;
+    }
+
+    if (!s_cart_line.active) {
+        if (!current_xy_um(&s_cart_line.start_x_um, &s_cart_line.start_y_um)) {
+            s_state = BINARY_TRAJ_STATE_ERROR;
+            s_run_requested = false;
+            return true;
+        }
+        s_cart_line.end_x_um = point->p1_abs;
+        s_cart_line.end_y_um = point->p2_abs;
+        int32_t dx = s_cart_line.end_x_um - s_cart_line.start_x_um;
+        int32_t dy = s_cart_line.end_y_um - s_cart_line.start_y_um;
+        s_cart_line.total_um = i32_isqrt_i64((int64_t)dx * dx + (int64_t)dy * dy);
+        s_cart_line.target_um = 0;
+        s_cart_line.feed_mm_min = point->v_dom_pps;
+        s_cart_line.active = true;
+        if (s_cart_line.total_um < 1) {
+            s_cart_line.active = false;
+            discard_current_point();
+            return true;
+        }
+    }
+
+    if (s_cart_line.target_um >= s_cart_line.total_um) {
+        if (!Stepper_IsBusy()) {
+            s_cart_line.active = false;
+            discard_current_point();
+        }
+        return true;
+    }
+
+    if (!cart_line_ready_for_next()) {
+        return true;
+    }
+
+    int32_t step_um = 500;
+    int32_t next_um = s_cart_line.target_um + step_um;
+    if (next_um > s_cart_line.total_um) {
+        next_um = s_cart_line.total_um;
+    }
+    int32_t dx = s_cart_line.end_x_um - s_cart_line.start_x_um;
+    int32_t dy = s_cart_line.end_y_um - s_cart_line.start_y_um;
+    int32_t tx = s_cart_line.start_x_um + (int32_t)(((int64_t)dx * next_um) / s_cart_line.total_um);
+    int32_t ty = s_cart_line.start_y_um + (int32_t)(((int64_t)dy * next_um) / s_cart_line.total_um);
+    bool final_segment = next_um >= s_cart_line.total_um;
+    if (!start_cart_line_segment(tx, ty, next_um - s_cart_line.target_um, s_cart_line.feed_mm_min, final_segment)) {
+        s_state = BINARY_TRAJ_STATE_ERROR;
+        s_run_requested = false;
+        return true;
+    }
+    s_cart_line.target_um = next_um;
+    return true;
+}
+
 static void service_motion_10khz(void)
 {
     if (s_run_requested && s_state == BINARY_TRAJ_STATE_RUNNING) {
@@ -399,6 +606,9 @@ static void service_motion_10khz(void)
     StepperState snapshot;
     Stepper_GetStateSnapshot(&snapshot);
     BinaryTrajPoint *point = &s_points[s_tail];
+    if (service_cartesian_line_10khz(point)) {
+        return;
+    }
     int32_t d1 = point->p1_abs - (int32_t)snapshot.axis[0].position_pulse;
     int32_t d2 = point->p2_abs - (int32_t)snapshot.axis[1].position_pulse;
     uint16_t dom = abs_i32_to_u16(abs(d1) > abs(d2) ? d1 : d2);
@@ -418,7 +628,10 @@ static void service_motion_10khz(void)
         }
     }
 
-    if (s_count > 1u) {
+    if ((point->flags & BT_POINT_FLAG_EXACT_STOP) != 0u) {
+        exit1 = 0;
+        exit2 = 0;
+    } else if (s_count > 1u) {
         BinaryTrajPoint *next = &s_points[next_index(s_tail)];
         int32_t nd1 = next->p1_abs - point->p1_abs;
         int32_t nd2 = next->p2_abs - point->p2_abs;

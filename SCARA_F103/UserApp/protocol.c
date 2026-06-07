@@ -134,7 +134,7 @@ void Protocol_ProcessLine(const char *line)
     } else if (strcmp(cmd, "HOSTCAP") == 0) {
         /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
         const AppParams *p = AppParams_Get();
-        SerialDma_SendFormat("OK HOSTCAP role=joint_interpolator host_plan=1 host_ik=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F legacy_gcode=1 binary_traj=1 joint_interp=1 control_hz=%lu ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
+        SerialDma_SendFormat("OK HOSTCAP role=joint_interpolator host_plan=1 host_ik=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F legacy_gcode=1 binary_traj=1 joint_interp=1 cartesian_line=1 exact_stop=1 dda_stepper=1 homing=real,sim control_hz=%lu ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
                              (unsigned long)APP_CONTROL_HZ,
                              (long)p->pulses_per_rev[0],
                              (long)p->pulses_per_rev[1]);
@@ -185,6 +185,18 @@ void Protocol_ProcessLine(const char *line)
                              home.home2_active ? 1u : 0u,
                              (unsigned int)home.active_mask,
                              (unsigned int)APP_HOME_SWITCH_ACTIVE_LEVEL);
+    } else if (strcmp(cmd, "HOME") == 0 || strcmp(cmd, "HOME_REAL") == 0) {
+        if (HomeController_Start(false)) {
+            SerialDma_Send("OK HOME_REAL\r\n");
+        } else {
+            SerialDma_Send("ERR HOME_BUSY\r\n");
+        }
+    } else if (strcmp(cmd, "HOME_SIM") == 0) {
+        if (HomeController_Start(true)) {
+            SerialDma_Send("OK HOME_SIM\r\n");
+        } else {
+            SerialDma_Send("ERR HOME_BUSY\r\n");
+        }
     } else if (strcmp(cmd, "WATCHDOG") == 0) {
         SerialDma_SendFormat("OK WATCHDOG enabled=%u timeout_ms=%lu idle_ms=%lu tripped=%u\r\n",
                              s_watchdog_enabled ? 1u : 0u,

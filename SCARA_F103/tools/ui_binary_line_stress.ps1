@@ -23,6 +23,8 @@ $TYPE_RUN = 0x13
 $TYPE_ACK = 0x80
 $TYPE_NACK = 0x81
 $PPR = 1600.0
+$FLAG_EXACT_STOP = 0x0001
+$FLAG_CARTESIAN_LINE = 0x0002
 $ZERO1_MRAD = 2251.0
 $ZERO2_MRAD = 890.0
 $MRAD_PER_REV = 6283.0
@@ -240,19 +242,14 @@ function New-PointPayload {
     $prev = [pscustomobject]@{ X = $StartX; Y = $StartY }
     $prevPulse = Convert-UiToPulse -X $prev.X -Y $prev.Y
     foreach ($target in $Targets) {
-        $pulse = Convert-UiToPulse -X $target.X -Y $target.Y
-        $dist = [Math]::Sqrt(($target.X - $prev.X) * ($target.X - $prev.X) + ($target.Y - $prev.Y) * ($target.Y - $prev.Y))
-        $dom = [Math]::Max([Math]::Abs($pulse.P1 - $prevPulse.P1), [Math]::Abs($pulse.P2 - $prevPulse.P2))
-        $duration = $dist / [Math]::Max(0.1, $FeedMmS)
-        $vdom = [int][Math]::Ceiling($dom / [Math]::Max(0.001, $duration))
-        if ($vdom -lt 16) { $vdom = 16 }
-        if ($vdom -gt 10000) { $vdom = 10000 }
-        Write-I32 -Bytes $bytes -Value $pulse.P1
-        Write-I32 -Bytes $bytes -Value $pulse.P2
-        Write-U16 -Bytes $bytes -Value $vdom
-        Write-U16 -Bytes $bytes -Value 0
+        $xUm = [int][Math]::Round(($target.X - $BASE_MM * 0.5) * 1000.0)
+        $yUm = [int][Math]::Round($target.Y * 1000.0)
+        $feedMmMin = [int][Math]::Round($FeedMmS * 60.0)
+        Write-I32 -Bytes $bytes -Value $xUm
+        Write-I32 -Bytes $bytes -Value $yUm
+        Write-U16 -Bytes $bytes -Value $feedMmMin
+        Write-U16 -Bytes $bytes -Value ($FLAG_EXACT_STOP -bor $FLAG_CARTESIAN_LINE)
         $prev = $target
-        $prevPulse = $pulse
     }
     return $bytes.ToArray()
 }
@@ -313,9 +310,8 @@ $serial.WriteTimeout = 1000
 
 try {
     Add-ExpectedLine
-    $targets = @(Get-AdaptiveLineTargets -A ([pscustomobject]@{ X = $StartX; Y = $StartY }) -B ([pscustomobject]@{ X = $EndX; Y = $EndY }))
-    if ($targets.Count -gt 120) { throw "too many UI binary keypoints: $($targets.Count)" }
-    Write-Host ("UI_BINARY_LINE keypoints={0} start=({1:F3},{2:F3}) end=({3:F3},{4:F3}) feed={5:F3}mm/s" -f $targets.Count, $StartX, $StartY, $EndX, $EndY, $FeedMmS)
+    $targets = @([pscustomobject]@{ X = $EndX; Y = $EndY })
+    Write-Host ("UI_BINARY_LINE keypoints={0} mode=cartesian_endpoint start=({1:F3},{2:F3}) end=({3:F3},{4:F3}) feed={5:F3}mm/s" -f $targets.Count, $StartX, $StartY, $EndX, $EndY, $FeedMmS)
     $serial.Open()
     Start-Sleep -Milliseconds 300
     while ($serial.BytesToRead -gt 0) { try { [void]$serial.ReadLine() } catch { break } }

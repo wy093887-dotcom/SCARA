@@ -22,7 +22,9 @@ class ScaraMotionMixin:
     PATH_MIN_POINT_SPACING_MM = 0.20
     TEXT_SIMPLIFY_TOLERANCE_MM = 0.06
     TEXT_MIN_POINT_SPACING_MM = 0.16
-    TEXT_CORNER_RADIUS_MM = 0.8
+    TEXT_CORNER_RADIUS_MM = 0.0
+    BINARY_FLAG_EXACT_STOP = 0x0001
+    BINARY_FLAG_CARTESIAN_LINE = 0x0002
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
@@ -225,11 +227,12 @@ class ScaraMotionMixin:
         cursor = (float(start[0]), float(start[1])) if start is not None else tuple(segments[0].start)
         targets = []
 
-        def append_points(points, silent=False):
-            for x, y in points:
+        def append_points(points, silent=False, exact_last=True):
+            for index, (x, y) in enumerate(points):
                 if targets and math.hypot(float(x) - targets[-1][0], float(y) - targets[-1][1]) <= 0.001:
                     continue
-                targets.append((float(x), float(y), feed_mm_min, silent))
+                flags = self.BINARY_FLAG_EXACT_STOP if exact_last and index == len(points) - 1 else 0
+                targets.append((float(x), float(y), feed_mm_min, silent, flags))
 
         if include_connector and math.hypot(cursor[0] - segments[0].start[0], cursor[1] - segments[0].start[1]) > 0.01:
             connector = self.generate_binary_line_targets(cursor, segments[0].start, speed_max, silent=True)
@@ -238,11 +241,11 @@ class ScaraMotionMixin:
 
         for segment in segments:
             if math.hypot(cursor[0] - segment.start[0], cursor[1] - segment.start[1]) > 0.01:
-                append_points([(p[0], p[1]) for p in self.generate_binary_line_targets(cursor, segment.start, speed_max, silent=True)], silent=True)
+                targets.extend(self.generate_binary_line_targets(cursor, segment.start, speed_max, silent=True))
             if segment.kind == "arc":
                 count = max(2, int(math.ceil(segment.length / self.BINARY_ARC_SEGMENT_MM)))
                 points = [segment.point_at(segment.length * i / count) for i in range(1, count + 1)]
-                append_points(points)
+                append_points(points, exact_last=True)
             else:
                 line_targets = self.generate_binary_line_targets(segment.start, segment.end, speed_max, silent=False)
                 for item in line_targets:
@@ -421,7 +424,11 @@ class ScaraMotionMixin:
         if not self.validate_trajectory_points(points, "二进制圆弧关键点"):
             return []
         feed_mm_min = float(speed_max) * 60.0
-        return [(x, y, feed_mm_min, silent) for x, y in points[1:]]
+        targets = []
+        for index, (x, y) in enumerate(points[1:], start=1):
+            flags = self.BINARY_FLAG_EXACT_STOP if index == len(points) - 1 else 0
+            targets.append((float(x), float(y), feed_mm_min, silent, flags))
+        return targets
 
     def _binary_pulse_from_xy(self, point, ppr):
         q1, q2 = self.inverse_kinematics(float(point[0]), float(point[1]))
@@ -492,12 +499,12 @@ class ScaraMotionMixin:
 
     def generate_binary_line_targets(self, start, end, speed_max, silent=False):
         """生成一条直线的二进制关键点；实际插补在下位机 10kHz 控制周期内完成。"""
-        ppr = int(getattr(self, "current_ppr", 3200))
-        keypoints = self._adaptive_binary_line_points(start, end, ppr)
+        keypoints = [(float(end[0]), float(end[1]))]
         if not self.validate_trajectory_points(keypoints, "二进制直线关键点"):
             return []
         feed_mm_min = float(speed_max) * 60.0
-        return [(float(x), float(y), feed_mm_min, silent) for x, y in keypoints]
+        flags = self.BINARY_FLAG_EXACT_STOP | self.BINARY_FLAG_CARTESIAN_LINE
+        return [(float(x), float(y), feed_mm_min, silent, flags) for x, y in keypoints]
 
     def start_recording(self):
         self.teach_data = [] 
@@ -1021,8 +1028,96 @@ class ScaraMotionMixin:
         except Exception as e:
             self.log_error(f"空心字{text}规划错误: {e}")
 
-    def system_reset(self): 
-        if self.board_only_debug:
+    def system_reset_simulated(self):
+        """仿真回零：不播放 UI 本地动画，只让下位机 HOME_SIM 运动并回传 M:x,y。"""
+
+        # 如果之前启动过 UI 本地回零动画，必须停止，避免和回传轨迹叠加。
+        timer = getattr(self, "_home_anim_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+        self._home_anim_frames = []
+        self._home_anim_index = 0
+
+        # 清理上位机运动队列，避免回零时继续发送轨迹。
+        self.point_queue = []
+        self.waiting_for_ack = False
+        self.last_sent_motion = None
+        self.stream_waiting_buffer = False
+        self.timeout_timer.stop()
+
+        # 清空反馈轨迹，让这次显示只包含 HOME_SIM 回传轨迹。
+        self.feedback_x, self.feedback_y = [], []
+        self.preview_x, self.preview_y = [], []
+        self.preview_label = ""
+        self.history_x, self.history_y = [self.cur_x], [self.cur_y]
+
+        # 进入回零反馈跟随模式：状态帧 M:x,y 将驱动当前机械臂姿态。
+        self.home_feedback_active = True
+        self.is_homed = False
+        self.home_sensor_triggered = False
+
+        # 建议自动切到“通讯接收内容”，让主机械臂姿态跟随回传。
+        if hasattr(self, "plot_mode_combo"):
+            self.plot_mode_combo.setCurrentText("通讯接收内容")
+
+        self.update_plot(force=True)
+
+        if not (self.ser and self.ser.is_open):
+            self.log_error("仿真回零需要连接下位机：当前没有串口，无法接收 HOME_SIM 回传轨迹")
+            return
+
+        self.log_display.append(
+            "<font color='cyan'>启动仿真回零：UI 不播放本地动画，只显示下位机 HOME_SIM 回传轨迹。</font>"
+        )
+
+        self.send_ascii_line("CLEAR_ERROR", "HOME_SIM_PREP")
+        self.send_ascii_line("ENABLE 1", "HOME_SIM_PREP")
+        self.send_ascii_line("HOME_SIM", "HOME_SIM")
+
+    def system_reset_real(self):
+        """实机回零：真实 HOME 开关，UI 只跟随下位机 M:x,y 回传。"""
+
+        timer = getattr(self, "_home_anim_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+        self.point_queue = []
+        self.waiting_for_ack = False
+        self.last_sent_motion = None
+        self.stream_waiting_buffer = False
+        self.timeout_timer.stop()
+
+        self.feedback_x, self.feedback_y = [], []
+        self.preview_x, self.preview_y = [], []
+        self.preview_label = ""
+        self.history_x, self.history_y = [self.cur_x], [self.cur_y]
+
+        self.home_feedback_active = True
+        self.is_homed = False
+        self.home_sensor_triggered = False
+
+        if hasattr(self, "plot_mode_combo"):
+            self.plot_mode_combo.setCurrentText("通讯接收内容")
+
+        self.update_plot(force=True)
+
+        if not (self.ser and self.ser.is_open):
+            self.log_error("实机回零需要连接串口")
+            return
+
+        self.log_display.append(
+            "<font color='cyan'>启动实机回零：UI 只显示下位机 HOME_REAL 回传轨迹。</font>"
+        )
+
+        self.send_ascii_line("CLEAR_ERROR", "HOME_REAL_PREP")
+        self.send_ascii_line("ENABLE 1", "HOME_REAL_PREP")
+        self.send_ascii_line("HOME_REAL", "HOME_REAL")
+
+    def system_reset(self, simulated=None): 
+        if simulated is None:
+            simulated = bool(getattr(self, "board_only_debug", False))
+        if False and self.board_only_debug:
             # 当前仅连接控制板，没有接 HOME 微动开关与电机，先用软件零点完成串口和队列调试。
             # 后续接入真实硬件后，将 board_only_debug 改为 False，即恢复发送 $H 的真实回零流程。
             self.is_homed = True
@@ -1040,10 +1135,10 @@ class ScaraMotionMixin:
             self.send_ascii_line("ZERO", "SOFT_ZERO")
             return
         if self.ser and self.ser.is_open:
-            ts = self.get_timestamp(); cmd = "$H"; self.is_homed = False
+            ts = self.get_timestamp(); cmd = "$H S" if simulated else "$H"; self.is_homed = False
             self.last_sent_cs = self.calculate_checksum(cmd); self.last_sent_package = cmd
-            self.log_display.append(f"<font color='#ffffff'>TX {ts} [HOME] $H</font>")
-            self.ser.write((cmd + "\n").encode('ascii')); self.waiting_for_ack = True; self.timeout_timer.start(10000) 
+            self.log_display.append(f"<font color='#ffffff'>TX {ts} [HOME] {cmd}</font>")
+            self.ser.write((cmd + "\n").encode('ascii')); self.waiting_for_ack = True; self.timeout_timer.start(30000) 
         else: self.log_error("串口未连接")
         
     def stop_motion(self):

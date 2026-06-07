@@ -95,8 +95,14 @@ class FiveBarSerialGUI(
         self.active_binary_send_path = []
         self.active_preview_path = []
 
+        # 如果接了真实电机和 HOME 开关，应该改成：
+        # self.board_only_debug = False
+        # self.is_homed = False
+
         self.board_only_debug = True
         self.is_homed = self.board_only_debug
+
+
         self.home_sensor_triggered = False
 
         self.move_timer = QTimer()

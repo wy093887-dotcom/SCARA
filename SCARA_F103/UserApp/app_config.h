@@ -97,8 +97,12 @@
 /* Homing switch and homing process parameters. */
 /* 0 means switch active-low, 1 means active-high. */
 #define APP_HOME_SWITCH_ACTIVE_LEVEL 0u
-/* Search direction for each homing axis. Use 1 or -1. */
-#define APP_HOME_AXIS1_DIR (-1)
+/* Search direction for each homing axis. Use 1 or -1. 
+// 左侧红色主动臂 Axis1：从 90° 竖直回零时应向左找水平限位，即角度增大到 180°。
+*/
+
+#define APP_HOME_AXIS1_DIR (1)
+// 右侧蓝色主动臂 Axis2：若 HOME2 安装在右水平位置，则从 90° 竖直向右找 0°，角度减小。
 #define APP_HOME_AXIS2_DIR (-1)
 /* Homing search speed in pulses per second. */
 #define APP_HOME_SEARCH_PPS 300
@@ -108,6 +112,16 @@
 #define APP_HOME_DEBOUNCE_MS 20u
 /* Maximum allowed homing duration before timeout. */
 #define APP_HOME_TIMEOUT_MS 30000u
+/* Joint angle references used by homing, in milliradians. 
+两个臂的回零 轴1向着左边，轴2向着右边
+左红臂水平回零点：向左水平 = 180° ≈ 3142 mrad。
+
+mrad = deg × π / 180 × 1000
+*/
+#define APP_HOME_AXIS1_HORIZONTAL_MRAD 3142L
+#define APP_HOME_AXIS2_HORIZONTAL_MRAD 0L
+#define APP_HOME_AXIS1_VERTICAL_MRAD 1571L
+#define APP_HOME_AXIS2_VERTICAL_MRAD 1571L
 
 /* G-code stream planner parameters. */
 /* Number of queued motion blocks kept by MCU. */

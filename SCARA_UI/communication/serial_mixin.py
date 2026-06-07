@@ -655,7 +655,9 @@ class ScaraSerialMixin:
              self.log_error("未回零，请先执行寻原点")
              self.point_queue = []
              return
-        tx, ty, feed_rate, slt = self.point_queue.pop(0)
+        motion_item = self.point_queue.pop(0)
+        tx, ty, feed_rate = motion_item[0], motion_item[1], motion_item[2]
+        slt = motion_item[3] if len(motion_item) > 3 else False
         self.last_sent_motion = (tx, ty, feed_rate, slt)
         self.sent_point_id += 1
         mcu_tx, mcu_ty = self.ui_to_mcu_xy(tx, ty)
