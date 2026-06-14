@@ -5,6 +5,7 @@ import time
 
 class ScaraPlotMixin:
     MAX_PLOT_TRACE_POINTS = 6000
+    MAX_PREVIEW_POINTS = 6000
     PLOT_DRAW_INTERVAL_S = 0.05
     FEEDBACK_LABEL_INTERVAL_S = 0.10
 
@@ -47,11 +48,17 @@ class ScaraPlotMixin:
                     self.ws_y.append(yi)
 
     def set_planned_preview(self, path, label="规划预览"):
-        self.preview_x = [float(p[0]) for p in path]
-        self.preview_y = [float(p[1]) for p in path]
+        display_path = path
+        if len(path) > self.MAX_PREVIEW_POINTS:
+            stride = (len(path) + self.MAX_PREVIEW_POINTS - 1) // self.MAX_PREVIEW_POINTS
+            display_path = list(path[::stride])
+            if display_path[-1] != path[-1]:
+                display_path.append(path[-1])
+        self.preview_x = [float(p[0]) for p in display_path]
+        self.preview_y = [float(p[1]) for p in display_path]
         self.preview_label = label
         if hasattr(self, "feedback_error_tracker"):
-            self.feedback_error_tracker.set_expected_path(path)
+            self.feedback_error_tracker.set_expected_path(display_path)
             self.latest_feedback_error = None
             self.feedback_error_stats = None
             self._update_feedback_error_label()

@@ -36,7 +36,9 @@ class FiveBarSerialGUI(
         self.HOME_X, self.HOME_Y = 75.0, 220.0
 
         self.accel = 100.0
+
         self.junction_dev = 0.02
+        
         self.dt = 0.02
 
         self.kinematics = FiveBarKinematics(
@@ -57,8 +59,12 @@ class FiveBarSerialGUI(
         self.cam_proc = CameraProcessor()
         self.coord_proc = CoordinateProcessor()
 
-        self.cur_x, self.cur_y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
-        self.HOME_X, self.HOME_Y = self.cur_x, self.cur_y
+        home_90 = self.kinematics.forward(90.0, 90.0)
+        if home_90[0] is not None and home_90[1] is not None:
+            self.HOME_X, self.HOME_Y = float(home_90[0]), float(home_90[1])
+        else:
+            self.HOME_X, self.HOME_Y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
+        self.cur_x, self.cur_y = self.HOME_X, self.HOME_Y
         self.history_x, self.history_y = [self.cur_x], [self.cur_y]
         self.feedback_x, self.feedback_y = [], []
         self.preview_x, self.preview_y = [], []
@@ -73,12 +79,10 @@ class FiveBarSerialGUI(
         self.teach_data = []
         self.teach_points = []
         self.point_queue = []
-        self.current_ppr = 3200
+        self.current_ppr = 6400
         self.microstep_dirty = True
 
         self.waiting_for_ack = False
-        self.last_sent_package = ""
-        self.last_sent_cs = ""
         self.last_sent_motion = None
         self.sent_point_id = 0
         self.total_task_points = 0
@@ -87,20 +91,28 @@ class FiveBarSerialGUI(
         self.heartbeat_count = 0
         self.ack_timeout_count = 0
         self.mcu_planner_free = 32
+        self.planner_free_hint = 32
+        self.planner_free_min = 32
+        self.rx_free_hint = 256
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
-        self.binary_seq = 1
+        self.motion_profile_sync_requested = False
+        self.laser_task_active = False
+        self.laser_preamble_needed = False
+        self.laser_power_permille = 10
+        self.laser_arm_sent_at = 0.0
+        self.pending_laser_power_permille = None
+        self.controller_capabilities = None
         self.emergency_paused = False
-        self.emergency_resume_path = []
-        self.active_binary_send_path = []
         self.active_preview_path = []
+        self.jog_target_xy = None
 
         # 如果接了真实电机和 HOME 开关，应该改成：
-        # self.board_only_debug = False
-        # self.is_homed = False
+        self.board_only_debug = False
+        self.is_homed = False
 
-        self.board_only_debug = True
-        self.is_homed = self.board_only_debug
+        # self.board_only_debug = True
+        # self.is_homed = self.board_only_debug
 
 
         self.home_sensor_triggered = False
@@ -108,7 +120,7 @@ class FiveBarSerialGUI(
         self.move_timer = QTimer()
         self.read_timer = QTimer()
         self.read_timer.timeout.connect(self.check_serial_feedback)
-        self.read_timer.start(10)
+        self.read_timer.start(2)
 
         self.timeout_timer = QTimer()
         self.timeout_timer.setSingleShot(True)

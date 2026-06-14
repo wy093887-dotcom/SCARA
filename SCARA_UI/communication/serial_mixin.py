@@ -1,31 +1,181 @@
 import re
-import struct
 import time
 
 import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
-
-from .binary_trajectory_protocol import (
-    TYPE_ACK,
-    TYPE_BEGIN,
-    TYPE_CHUNK,
-    TYPE_NACK,
-    TYPE_RUN,
-    TYPE_STATUS,
-    TYPE_STATUS_RSP,
-    TYPE_VALIDATE,
-    build_begin_payload,
-    build_chunk_payload,
-    build_frame,
-    parse_frame,
-    path_to_joint_points,
-)
+from .motion_senders import GRBL_GCODE_SENDER
 from .serial_protocol import build_g1_line, build_ppr_line, parse_ok_ack
+from .serial_worker import SerialThreadTransport
 
 
 class ScaraSerialMixin:
+    def _sender_now(self):
+        return time.time()
+
+    def _apply_home_state(self, state):
+        state = (state or "").strip().lower()
+        if state == "done":
+            self.is_homed = True
+            self.home_sensor_triggered = False
+            self.home_feedback_active = False
+            self.motion_preamble_needed = True
+            if hasattr(self, "_reset_jog_anchor"):
+                self._reset_jog_anchor()
+        elif state == "error":
+            self.is_homed = False
+
+    def _laser_requested(self):
+        toggle = getattr(self, "laser_enable_toggle", None)
+        return bool(toggle is not None and toggle.isChecked())
+
+    def _laser_power_from_ui(self):
+        widget = getattr(self, "laser_power_input", None)
+        percent = float(widget.value()) if widget is not None else 1.0
+        return max(1, min(50, int(round(percent * 10.0))))
+
+    def _laser_s_word(self):
+        return max(0, min(1000, int(round(float(getattr(self, "laser_power_permille", 10)) * 20.0))))
+
+    def _begin_laser_task_from_ui(self):
+        if getattr(self, "laser_task_active", False):
+            return True
+        if not self._laser_requested():
+            return False
+        if not (self.ser and self.ser.is_open):
+            self.log_error("激光加工使能已取消：串口未连接。")
+            self._reset_laser_task_ui()
+            return False
+        self.laser_power_permille = self._laser_power_from_ui()
+        self.laser_task_active = True
+        self.laser_preamble_needed = True
+        self.motion_preamble_needed = True
+        return True
+
+    def _set_laser_button_visual(self, enabled):
+        button = getattr(self, "laser_enable_toggle", None)
+        if button is None:
+            return
+        if hasattr(button, "setText"):
+            button.setText("激光关闭" if enabled else "激光开启")
+        if hasattr(button, "setStyleSheet"):
+            color = "#e74c3c" if enabled else "#34495e"
+            button.setStyleSheet(f"background-color: {color}; color: white; font-weight: bold;")
+
+    def _set_laser_button_checked(self, checked):
+        button = getattr(self, "laser_enable_toggle", None)
+        if button is None:
+            return
+        blocked = False
+        if hasattr(button, "blockSignals"):
+            blocked = button.blockSignals(True)
+        if hasattr(button, "setChecked"):
+            button.setChecked(bool(checked))
+        if hasattr(button, "blockSignals"):
+            button.blockSignals(blocked)
+        self._set_laser_button_visual(bool(checked))
+
+    def _write_laser_command(self, cmd):
+        if not (self.ser and self.ser.is_open):
+            return False
+        self.ser.write((cmd + "\n").encode("ascii"))
+        if hasattr(self, "log_display"):
+            self.log_display.append(f"<font color='#bbbbbb'>TX {self.get_timestamp()} [LASER] {cmd}</font>")
+        return True
+
+    def _force_laser_disarm(self):
+        try:
+            if self.ser and self.ser.is_open:
+                self._write_laser_command("LASER DISARM")
+        except Exception:
+            pass
+        self._reset_laser_task_ui()
+
+    def _send_laser_power_now(self):
+        if not getattr(self, "laser_task_active", False):
+            return False
+        power = int(getattr(self, "laser_power_permille", self._laser_power_from_ui()))
+        if self._write_laser_command(f"LASER POWER {power}"):
+            self.pending_laser_power_permille = None
+            return True
+        return False
+
+    def _flush_pending_laser_power(self, force=False):
+        pending = getattr(self, "pending_laser_power_permille", None)
+        if pending is None:
+            return
+        if not getattr(self, "laser_task_active", False):
+            self.pending_laser_power_permille = None
+            return
+        if self.ser and self.ser.is_open and not getattr(self, "waiting_for_ack", False):
+            self.laser_power_permille = int(pending)
+            self._send_laser_power_now()
+
+    def on_laser_power_changed(self, *_):
+        self.laser_power_permille = self._laser_power_from_ui()
+        if not getattr(self, "laser_task_active", False):
+            return
+        if self.ser and self.ser.is_open and not getattr(self, "waiting_for_ack", False):
+            self._send_laser_power_now()
+        else:
+            self.pending_laser_power_permille = int(self.laser_power_permille)
+
+    def on_laser_enable_toggled(self, checked):
+        if checked:
+            if not (self.ser and self.ser.is_open):
+                self.log_error("激光开启失败：串口未连接。")
+                self._reset_laser_task_ui()
+                return
+            self.laser_power_permille = self._laser_power_from_ui()
+            self.laser_task_active = True
+            self.laser_preamble_needed = False
+            self.motion_preamble_needed = True
+            self._set_laser_button_visual(True)
+            try:
+                self._write_laser_command(f"LASER POWER {int(self.laser_power_permille)}")
+                self._write_laser_command("LASER ARM")
+                self.laser_arm_sent_at = time.time()
+            except Exception as exc:
+                self.log_error(f"Laser enable failed: {exc}")
+                self._force_laser_disarm()
+        else:
+            self._force_laser_disarm()
+
+    def _reset_laser_task_ui(self):
+        self.laser_task_active = False
+        self.laser_preamble_needed = False
+        self.laser_arm_sent_at = 0.0
+        self.pending_laser_power_permille = None
+        toggle = getattr(self, "laser_enable_toggle", None)
+        if toggle is not None:
+            self._set_laser_button_checked(False)
+        label = getattr(self, "laser_status_label", None)
+        if label is not None:
+            label.setText("下位机状态: 断开")
+            label.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+
+    def _update_laser_status(self, raw):
+        match = re.search(r'(?:Lz:|laser=)(\d+),(\d+),(\d+),(\d+)', raw)
+        if not match:
+            return
+        armed, ready, marking, power = (int(match.group(index)) for index in range(1, 5))
+        self.laser_power_permille = power
+        label = getattr(self, "laser_status_label", None)
+        if armed == 0:
+            text, color = "下位机状态: 断开", "#aaaaaa"
+        elif ready == 0:
+            text, color = "下位机状态: 准备中", "#f39c12"
+        elif marking:
+            text, color = f"下位机状态: 落笔 {power / 10.0:.1f}%", "#e74c3c"
+        else:
+            text, color = f"下位机状态: 抬笔 {power / 10.0:.1f}%", "#2ecc71"
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        arm_age = time.time() - float(getattr(self, "laser_arm_sent_at", 0.0) or 0.0)
+        if armed == 0 and getattr(self, "laser_task_active", False) and arm_age > 0.5:
+            self._reset_laser_task_ui()
+
     def ui_to_mcu_xy(self, x, y):
         return x - self.L0 * 0.5, y
 
@@ -33,18 +183,65 @@ class ScaraSerialMixin:
         return x + self.L0 * 0.5, y
 
     def _write_motion_preamble(self):
-        if not self.ser or not self.ser.is_open or not self.motion_preamble_needed:
-            return
-        for cmd in ("CLEAR_ERROR", "ENABLE 1"):
-            self.ser.write((cmd + "\n").encode('ascii'))
-            self.log_display.append(
-                f"<font color='#bbbbbb'>TX {self.get_timestamp()} [MOTION_PREP] {cmd}</font>"
+        # Preamble commands are part of the same character-counted GcodeJob.
+        return
+
+    def load_gcode_job(self, commands, preview_path=None, append=False):
+        """Queue real G-code without converting the command iterable to a list."""
+        if not commands:
+            return False
+        accepted = GRBL_GCODE_SENDER.send(self, commands, append=append, send_path=None)
+        if preview_path is not None:
+            self.active_preview_path = preview_path
+        return bool(accepted)
+
+    def _motion_profile_preamble(self):
+        profile = tuple(getattr(self, "_pending_motion_profile", ()) or ())
+        self._pending_motion_profile = ()
+        return profile
+
+    def _prepare_motion_profile(self):
+        speed_mm_s = float(self._read_run_speed_mm_s())
+        accel_mm_s2 = float(self._read_run_accel_mm_s2())
+        junction_deviation = float(getattr(self, "junction_dev", 0.02))
+        if hasattr(self, "path_planner"):
+            self.path_planner.accel_mm_s2 = max(1.0, accel_mm_s2)
+            self.path_planner.junction_deviation = max(0.001, junction_deviation)
+
+        commands = []
+        if getattr(self, "microstep_dirty", False):
+            ppr = int(self.microstep_combo.currentText())
+            commands.append(build_ppr_line(ppr))
+            self.current_ppr = ppr
+            self.microstep_dirty = False
+        commands.extend(
+            (
+                f"$110={max(1, int(round(speed_mm_s * 60.0)))}",
+                f"$120={max(1, int(round(accel_mm_s2)))}",
+                f"$11={max(1, int(round(junction_deviation * 1000.0)))}",
             )
-        self.motion_preamble_needed = False
+        )
+        self._pending_motion_profile = tuple(commands)
+
+    def load_motion_gcode_job(self, commands, preview_path=None, append=False):
+        """Queue geometry G-code with one GRBL motion profile per new task."""
+        appending_active_motion = bool(
+            append and (self.waiting_for_ack or self.point_queue or getattr(self, "inflight_lines", None))
+        )
+        if not appending_active_motion:
+            try:
+                self._prepare_motion_profile()
+            except Exception as exc:
+                self.log_error(f"Motion profile is invalid: {exc}")
+                return False
+            self.motion_profile_sync_requested = True
+            self._begin_laser_task_from_ui()
+        return self.load_gcode_job(commands, preview_path=preview_path, append=append)
 
     def _request_controller_diagnostics(self):
         if self.ser and self.ser.is_open:
-            self.ser.write(b"ERRORS\n?\n")
+            if not getattr(self, "inflight_lines", None):
+                self.ser.write(b"?")
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -57,17 +254,29 @@ class ScaraSerialMixin:
             try:
                 port = self.port_combo.currentText()
                 if not port: return
-                self.ser = serial.Serial(port, 115200, timeout=0.1)
+                self.ser = SerialThreadTransport(port, 115200, self)
+                self.ser.open()
                 self.serial_status.setText("已连接")
                 self.serial_status.setStyleSheet("color: green;")
                 self.btn_connect.setText("断开")
                 self.motion_preamble_needed = True
+                self.controller_capabilities = None
                 self.microstep_dirty = True
                 self.apply_microstep_setting()
-                self.heartbeat_timer.start(200) 
+                self.heartbeat_timer.start(200)
             except Exception as e:
                 self.log_error(f"连接失败: {e}")
         else:
+            try:
+                if hasattr(self, "stop_motion"):
+                    self.stop_motion()
+                self._force_laser_disarm()
+                if self.ser and self.ser.is_open:
+                    self.ser.flush()
+                time.sleep(0.02)
+            except Exception:
+                pass
+            self._reset_laser_task_ui()
             self.ser.close()
             self.heartbeat_timer.stop()
             self.serial_status.setText("未连接")
@@ -75,72 +284,54 @@ class ScaraSerialMixin:
             self.btn_connect.setText("连接")
 
     def send_heartbeat(self):
-        if getattr(self, "binary_stream_active", False):
-            return
         if self.ser and self.ser.is_open and not self.waiting_for_ack:
             self.heartbeat_count += 1
-            self.ser.write(f"HEARTBEAT {self.heartbeat_count}\n".encode('ascii'))
+            if not getattr(self, "inflight_lines", None):
+                self.ser.write(b"?")
 
     def load_motion_queue(self, path, append=False, send_path=None):
-        # 统一装载轨迹，避免各个按钮重复维护计数器。
-        #
-        # 路径选择规则：
-        # 1. send_path 不为空、控制器空闲、append=False：走二进制关节轨迹，MCU 负责 10kHz 插补。
-        # 2. append=True 或控制器已有 ASCII 队列：走旧 G1 点流，用于兼容连续追加点动。
-        # 3. 若当前点不在轨迹起点，_motion_path_with_current_connector 会自动补一段静默连接线。
-        #
-        # 调节建议：
-        # - 点动/固定轨迹想更平滑，优先调 motion_mixin.py 的 BINARY_LINE_TOLERANCE_MM、PPR。
-        # - 上传卡顿明显时，调 _upload_binary_motion 内 preload/chunk_size 或后台续传周期。
+        """Stream a sampled preview path as lazy real Cartesian G-code."""
         if not path:
-            self.log_error("未生成有效轨迹")
+            self.log_error("No valid motion path was generated.")
             return
         self.emergency_paused = False
-        self.emergency_resume_path = []
         if hasattr(self, "_set_emergency_button_paused"):
             self._set_emergency_button_paused(False)
-        if getattr(self, "microstep_dirty", False) and self.ser and self.ser.is_open:
-            self.apply_microstep_setting()
         if not append:
             prepared = self._motion_path_with_current_connector(path, send_path)
             if prepared is None:
                 return
             path, send_path = prepared
-        if (
-            send_path
-            and not append
-            and self.ser
-            and self.ser.is_open
-            and not self.waiting_for_ack
-            and not self.point_queue
-        ):
-            start_x, start_y = self.cur_x, self.cur_y
-            self.active_binary_send_path = list(send_path)
-            self.active_preview_path = list(path)
-            if self._upload_binary_motion(send_path):
-                self.sent_point_id = len(send_path)
-                self.total_task_points = len(send_path)
-                self.task_start_time = time.time()
-                self.point_queue = []
-                self.last_sent_motion = None
-                self.waiting_for_ack = False
-                if self.plot_mode_combo.currentText() == "通讯发送内容":
-                    self.history_x = [float(start_x)]
-                    self.history_y = [float(start_y)]
-                    self.update_plot(force=True)
-                return
-            self.active_binary_send_path = []
-            self.log_display.append("<font color='orange'>二进制轨迹上传失败，回退到 ASCII G1 点流。</font>")
-        if append and (self.waiting_for_ack or self.point_queue):
-            self.point_queue.extend(path)
-            self.total_task_points += len(path)
+            laser_enabled = self._begin_laser_task_from_ui()
         else:
-            self.sent_point_id = 0
-            self.total_task_points = len(path)
-            self.task_start_time = time.time()
-            self.point_queue = path
-        self.active_preview_path = list(path)
-        self.process_queue()
+            laser_enabled = bool(getattr(self, "laser_task_active", False))
+        self.log_display.append(
+            f"<font color='#bbbbbb'>mode=grbl_stream selected append={int(bool(append))} "
+            f"preview_points={len(path)}</font>"
+        )
+        self.load_motion_gcode_job(
+            self._iter_path_gcode(path, laser_enabled),
+            preview_path=path,
+            append=append,
+        )
+
+    def _iter_path_gcode(self, path, laser_enabled=False):
+        marking = bool(laser_enabled)
+        for point in path:
+            x, y = self.ui_to_mcu_xy(float(point[0]), float(point[1]))
+            feed = max(1, int(round(float(point[2])))) if len(point) > 2 else 300
+            silent = bool(point[3]) if len(point) > 3 else False
+            wants_mark = bool(laser_enabled and not silent)
+            if wants_mark != marking:
+                if wants_mark:
+                    yield f"M4 S{self._laser_s_word()}"
+                else:
+                    yield "M5"
+                marking = wants_mark
+            if silent:
+                yield f"G0 X{x:.3f} Y{y:.3f}"
+            else:
+                yield f"G1 X{x:.3f} Y{y:.3f} F{feed}"
 
     def _motion_path_with_current_connector(self, path, send_path=None):
         if not path:
@@ -159,268 +350,167 @@ class ScaraSerialMixin:
                 )
                 return None
             path = connector + list(path)
-            if send_path:
-                if hasattr(self, "generate_binary_send_from_path"):
-                    connector_send = self.generate_binary_send_from_path(connector, feed_mm_s, start=(start_x, start_y))
-                else:
-                    connector_send = connector
-                send_path = list(connector_send) + list(send_path)
             if hasattr(self, "set_planned_preview"):
                 self.set_planned_preview(path, getattr(self, "preview_label", "轨迹预览") or "轨迹预览")
             self.log_display.append(
                 f"<font color='#bbbbbb'>自动补充到轨迹起点连接段: ({start_x:.1f},{start_y:.1f}) -> ({first_x:.1f},{first_y:.1f})</font>"
             )
-            return path, send_path
+            return path, None
         except Exception as exc:
             self.log_error(f"轨迹起点连接段规划失败: {exc}")
             return None
 
-    def _read_binary_frame(self, timeout_s=1.0):
+    def _set_sender_status(self, mode, **stats):
+        self.sender_mode = str(mode)
+        current = dict(getattr(self, "sender_stats", {}) or {})
+        current.update(stats)
+        self.sender_stats = current
+        queued = current.get("queued", current.get("queued_lines", "--"))
+        inflight = current.get("inflight", current.get("inflight_lines", "--"))
+        free = current.get("planner_free", current.get("free", "--"))
+        rx_free = current.get("rx_free", getattr(self, "rx_free_hint", "--"))
+        step_count = current.get("step_segment_count", "--")
+        step_free = current.get("step_segment_free", "--")
+        low = current.get("segment_low_water", current.get("low_water", "--"))
+        underrun = current.get("underrun", current.get("underrun_ticks", "--"))
+        underrun_count = current.get("segment_underrun_count", "--")
+        free_min = current.get("planner_free_min", getattr(self, "planner_free_min", "--"))
+        if free_min is None:
+            free_min = "--"
+        ack_ms = current.get("avg_ack_ms", "--")
+        status_text = (
+            f"Sender: {self.sender_mode}  queued={queued} inflight={inflight} "
+            f"free={free}/{rx_free} min={free_min} sq={step_count}/{step_free} "
+            f"low={low} underrun={underrun}/{underrun_count} avg_ack={ack_ms}"
+        )
+        label = getattr(self, "lbl_sender_mode", None)
+        if label is not None:
+            label.setText(status_text)
+        elif getattr(self, "ser", None) is not None and self.ser.is_open and hasattr(self, "serial_status"):
+            self.serial_status.setText(status_text)
+
+    def _clear_text_sender_state(self):
+        self.inflight_lines = []
+        self.inflight_bytes = 0
+        self.waiting_for_ack = False
+        self.last_sent_motion = None
+        self.planner_free_min = None
+
+    def _update_planner_free_hint(self, free):
+        free = max(0, int(free))
+        self.planner_free_hint = free
+        previous = getattr(self, "planner_free_min", None)
+        self.planner_free_min = free if previous is None else min(int(previous), free)
+        return free
+
+    def _text_sender_limits(self):
+        planner_free = getattr(self, "planner_free_hint", getattr(self, "mcu_planner_free", None))
+        max_lines = 64
+        rx_free = getattr(self, "rx_free_hint", None)
+        max_bytes = 224
+        if isinstance(rx_free, int):
+            max_bytes = max(32, min(max_bytes, rx_free - 16))
+        return max_lines, max_bytes
+
+    def _line_from_motion_item(self, motion_item):
+        if isinstance(motion_item, str):
+            return motion_item.strip(), "grbl_stream", motion_item
+
+        tx, ty, feed_rate = motion_item[0], motion_item[1], motion_item[2]
+        slt = motion_item[3] if len(motion_item) > 3 else False
+        mcu_tx, mcu_ty = self.ui_to_mcu_xy(tx, ty)
+        gcode_raw = build_g1_line(
+            mcu_tx,
+            mcu_ty,
+            feed_rate,
+            self.sent_point_id + 1,
+            limit_checked=True,
+        )
+
+        if self.plot_mode_combo.currentText() == "通讯发送内容":
+            self.cur_x, self.cur_y = tx, ty
+            if slt:
+                self.history_x, self.history_y = [tx], [ty]
+            else:
+                self.history_x.append(tx)
+                self.history_y.append(ty)
+            ik = self.inverse_kinematics(tx, ty)
+            if ik and ik[0] is not None:
+                self.update_plot(ik[0], ik[1])
+        return gcode_raw, "gcode_stream", motion_item
+
+    @staticmethod
+    def _line_requires_homing(line):
+        text = str(line).lstrip().upper()
+        return text.startswith("$J=") or re.match(r"^G0?[0-3](?:\s|$)", text) is not None
+
+    def _fill_ascii_sender_window(self):
         if not self.ser or not self.ser.is_open:
-            return None
-        deadline = time.time() + timeout_s
-        buf = bytearray()
-        expected_len = None
-        while time.time() < deadline:
-            chunk = self.ser.read(1)
-            if not chunk:
-                self._pump_ui_events()
-                continue
-            byte = chunk[0]
-            if len(buf) == 0:
-                if byte == 0xA5:
-                    buf.append(byte)
-                continue
-            if len(buf) == 1:
-                if byte == 0x5A:
-                    buf.append(byte)
-                elif byte == 0xA5:
-                    buf[:] = b"\xA5"
-                else:
-                    buf.clear()
-                continue
-            buf.append(byte)
-            if len(buf) == 8 and expected_len is None:
-                payload_len = struct.unpack_from("<H", buf, 6)[0]
-                expected_len = 10 + payload_len
-                if expected_len > 512:
-                    buf.clear()
-                    expected_len = None
-                    continue
-            if expected_len is not None and len(buf) >= expected_len:
-                return parse_frame(bytes(buf[:expected_len]))
-        return None
-
-    def _pump_ui_events(self):
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
-
-    def _send_binary_frame_expect_ack(self, frame_type, seq, payload=b"", timeout_s=1.0):
-        self.ser.write(build_frame(frame_type, seq, payload))
-        frame = self._read_binary_frame(timeout_s=timeout_s)
-        if frame is None:
-            raise TimeoutError(f"binary frame 0x{frame_type:02X} timeout")
-        if frame.seq != (seq & 0xFFFF):
-            raise ValueError(f"binary seq mismatch: tx={seq & 0xFFFF}, rx={frame.seq}")
-        if frame.frame_type == TYPE_NACK:
-            err = frame.payload[1] if len(frame.payload) > 1 else 255
-            raise ValueError(f"binary NACK type=0x{frame_type:02X} err={err}")
-        if frame.frame_type != TYPE_ACK:
-            raise ValueError(f"unexpected binary response type=0x{frame.frame_type:02X}")
-        if len(frame.payload) >= 2 and frame.payload[0] == frame_type and frame.payload[1] != 0:
-            raise ValueError(f"binary ACK err={frame.payload[1]}")
-        return frame
-
-    def _send_binary_status(self, seq, timeout_s=1.0):
-        self.ser.write(build_frame(TYPE_STATUS, seq, b""))
-        frame = self._read_binary_frame(timeout_s=timeout_s)
-        if frame is None:
-            raise TimeoutError("binary status timeout")
-        if frame.seq != (seq & 0xFFFF):
-            raise ValueError(f"binary status seq mismatch: tx={seq & 0xFFFF}, rx={frame.seq}")
-        if frame.frame_type != TYPE_STATUS_RSP:
-            raise ValueError(f"unexpected status response type=0x{frame.frame_type:02X}")
-        payload = frame.payload
-        if len(payload) < 19:
-            raise ValueError("short binary status payload")
-        queued = struct.unpack_from("<H", payload, 2)[0]
-        free = struct.unpack_from("<H", payload, 4)[0]
-        accepted = struct.unpack_from("<I", payload, 6)[0]
-        executed = struct.unpack_from("<I", payload, 10)[0]
-        total = struct.unpack_from("<I", payload, 14)[0]
-        state = payload[18]
-        return {
-            "queued": queued,
-            "free": free,
-            "accepted": accepted,
-            "executed": executed,
-            "total": total,
-            "state": state,
-        }
-
-    def _send_ascii_wait_ok(self, line, timeout_s=1.5):
-        deadline = time.time() + timeout_s
-        self.ser.write((line + "\n").encode("ascii"))
-        self.log_display.append(f"<font color='#bbbbbb'>TX {self.get_timestamp()} [BINARY_PREP] {line}</font>")
-        while time.time() < deadline:
-            raw = self.ser.readline().decode("ascii", errors="ignore").strip()
-            if not raw:
-                continue
-            if raw.lower().startswith("ok"):
-                self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} [BINARY_PREP] {raw}</font>")
-                return True
-            if raw.startswith("<"):
-                continue
-            if "error:" in raw.lower():
-                raise ValueError(raw)
-        raise TimeoutError(f"ASCII prep timeout: {line}")
-
-    def _upload_binary_motion(self, send_path):
-        """上传二进制关节轨迹并启动下位机插补。
-
-        这里先预装 preload 个关键点，然后立即 RUN，剩余关键点交给 QTimer 后台续传。
-        这样复杂轨迹不会长时间占住 UI 线程，界面也不会在点击后“没反应”。
-        """
-        if not send_path:
             return False
-        start_xy = (self.cur_x, self.cur_y)
-        try:
-            points = path_to_joint_points(send_path, self.kinematics, self.current_ppr, start_xy=start_xy)
-            if not points:
-                self.log_error("二进制轨迹无有效关节目标点")
-                return False
-        except Exception as exc:
-            self.log_error(f"二进制轨迹转换失败: {exc}")
+        if not self.point_queue:
             return False
+        inflight = getattr(self, "inflight_lines", None)
+        if inflight is None:
+            inflight = []
+            self.inflight_lines = inflight
+            self.inflight_bytes = 0
 
-        read_was_active = self.read_timer.isActive()
-        heartbeat_was_active = self.heartbeat_timer.isActive()
-        if read_was_active:
-            self.read_timer.stop()
-        if heartbeat_was_active:
-            self.heartbeat_timer.stop()
-        self.timeout_timer.stop()
+        max_lines, max_bytes = self._text_sender_limits()
+        sent_any = False
+        while self.point_queue and len(inflight) < max_lines:
+            motion_item = self.point_queue[0]
+            gcode_raw, mode, motion_record = self._line_from_motion_item(motion_item)
+            if not gcode_raw:
+                self.point_queue.pop(0)
+                continue
+            if not self.board_only_debug and self._line_requires_homing(gcode_raw):
+                if self.home_sensor_triggered:
+                    self.log_error("Home switch is active; motion stream stopped.")
+                    self.point_queue.clear()
+                    return True
+                if not self.is_homed:
+                    self.log_error("Not homed; run homing before motion.")
+                    self.point_queue.clear()
+                    return True
+            line_bytes = len(gcode_raw.encode("ascii", errors="ignore")) + 1
+            if inflight and (self.inflight_bytes + line_bytes > max_bytes):
+                break
 
-        try:
-            for cmd in ("STOP", "CLEAR_ERROR", "ENABLE 1"):
-                self._send_ascii_wait_ok(cmd)
-            self.motion_preamble_needed = False
-            seq = getattr(self, "binary_seq", 1) & 0xFFFF
-            self._send_binary_frame_expect_ack(TYPE_BEGIN, seq, build_begin_payload(len(points)))
-            seq = (seq + 1) & 0xFFFF
-            # chunk_size：每个二进制 CHUNK 包含的关键点数量。
-            # 调大可减少协议开销，但单次串口阻塞时间更长；调小 UI 更灵敏但包数更多。
-            chunk_size = 20
-            sent = 0
-            # preload：启动前预装点数。太小容易下位机欠载，太大点击后等待变长。
-            preload = min(len(points), 100)
-            while sent < preload:
-                take = min(chunk_size, preload - sent)
-                chunk = points[sent : sent + take]
-                self._send_binary_frame_expect_ack(TYPE_CHUNK, seq, build_chunk_payload(chunk))
-                seq = (seq + 1) & 0xFFFF
-                sent += take
-                self._pump_ui_events()
-            self._send_binary_frame_expect_ack(TYPE_VALIDATE, seq)
-            seq = (seq + 1) & 0xFFFF
-            self._send_binary_frame_expect_ack(TYPE_RUN, seq)
-            seq = (seq + 1) & 0xFFFF
-            self._start_binary_stream(points, sent, seq, chunk_size)
-            self.log_display.append(
-                f"<font color='#00ff99'>二进制关节轨迹已启动: keypoints={len(points)} preload={sent} control_hz=10000</font>"
+            self.point_queue.pop(0)
+            self.sent_point_id += 1
+            self.last_sent_motion = motion_record
+            if not sent_any:
+                self._write_motion_preamble()
+            ts = self.get_timestamp()
+            tag = "gcode"
+            log_msg = (
+                f"TX {ts} [{tag} {self.sent_point_id}/{self.total_task_points}] "
+                f"len={line_bytes} line={gcode_raw}"
             )
-            return True
-        except Exception as exc:
-            self.log_error(f"二进制轨迹上传错误: {exc}")
-            return False
-        finally:
-            if read_was_active:
-                self.read_timer.start(10)
-            if heartbeat_was_active:
-                self.heartbeat_timer.start(200)
+            self.log_display.append(f"<font color='#ffffff'>{log_msg}</font>")
+            self.ser.write((gcode_raw + "\n").encode("ascii"))
+            entry = {
+                "line": gcode_raw,
+                "bytes": line_bytes,
+                "sent_at": time.time(),
+                "mode": mode,
+                "id": self.sent_point_id,
+                "motion": motion_record,
+            }
+            inflight.append(entry)
+            self.inflight_bytes = int(getattr(self, "inflight_bytes", 0)) + line_bytes
+            sent_any = True
 
-    def _start_binary_stream(self, points, sent, seq, chunk_size):
-        """启动后台续传，把 RUN 之后还没下发的关键点分批补给 MCU。"""
-        self.binary_stream_points = list(points)
-        self.binary_stream_sent = int(sent)
-        self.binary_stream_seq = int(seq) & 0xFFFF
-        self.binary_stream_chunk_size = int(chunk_size)
-        self.binary_stream_active = self.binary_stream_sent < len(self.binary_stream_points)
-        if not self.binary_stream_active:
-            self.binary_seq = self.binary_stream_seq
-            return
-        if not hasattr(self, "binary_stream_timer"):
-            self.binary_stream_timer = QTimer()
-            self.binary_stream_timer.timeout.connect(self._continue_binary_stream)
-        # 续传周期 20ms：兼顾 UI 响应和串口缓冲余量；若状态中出现 underrun，可适当调小。
-        self.binary_stream_timer.start(20)
-
-    def _stop_binary_stream(self):
-        timer = getattr(self, "binary_stream_timer", None)
-        if timer is not None and timer.isActive():
-            timer.stop()
-        self.binary_stream_active = False
-        self.binary_stream_points = []
-        self.binary_stream_sent = 0
-
-    def _continue_binary_stream(self):
-        """后台续传定时器回调：查询 MCU 空余缓冲，再补发少量 CHUNK。"""
-        if not getattr(self, "binary_stream_active", False):
-            return
-        if not self.ser or not self.ser.is_open:
-            self._stop_binary_stream()
-            return
-        points = getattr(self, "binary_stream_points", [])
-        sent = int(getattr(self, "binary_stream_sent", 0))
-        seq = int(getattr(self, "binary_stream_seq", getattr(self, "binary_seq", 1))) & 0xFFFF
-        if sent >= len(points):
-            self.binary_seq = seq
-            self._stop_binary_stream()
-            self.log_display.append("<font color='#00ff99'>二进制轨迹剩余关键点已全部下发。</font>")
-            return
-
-        read_was_active = self.read_timer.isActive()
-        heartbeat_was_active = self.heartbeat_timer.isActive()
-        if read_was_active:
-            self.read_timer.stop()
-        if heartbeat_was_active:
-            self.heartbeat_timer.stop()
-        try:
-            status = self._send_binary_status(seq, timeout_s=0.15)
-            seq = (seq + 1) & 0xFFFF
-            free = int(status["free"])
-            chunks_this_tick = 0
-            # 每个 UI tick 最多补两包，避免串口读写长时间占用主线程。
-            while free > 0 and sent < len(points) and chunks_this_tick < 2:
-                take = min(int(getattr(self, "binary_stream_chunk_size", 20)), free, len(points) - sent)
-                if take <= 0:
-                    break
-                self._send_binary_frame_expect_ack(
-                    TYPE_CHUNK,
-                    seq,
-                    build_chunk_payload(points[sent : sent + take]),
-                    timeout_s=0.15,
-                )
-                seq = (seq + 1) & 0xFFFF
-                sent += take
-                free -= take
-                chunks_this_tick += 1
-            self.binary_stream_sent = sent
-            self.binary_stream_seq = seq
-            if sent >= len(points):
-                self.binary_seq = seq
-                self._stop_binary_stream()
-                self.log_display.append("<font color='#00ff99'>二进制轨迹剩余关键点已全部下发。</font>")
-        except Exception as exc:
-            self.log_error(f"二进制轨迹后台续传错误: {exc}")
-            self._stop_binary_stream()
-        finally:
-            if read_was_active:
-                self.read_timer.start(10)
-            if heartbeat_was_active and not getattr(self, "binary_stream_active", False):
-                self.heartbeat_timer.start(200)
-            self._pump_ui_events()
+        if inflight:
+            self.waiting_for_ack = True
+            self.timeout_timer.start(1000)
+            self._set_sender_status(
+                inflight[0].get("mode", "gcode_stream"),
+                queued_lines=len(self.point_queue),
+                inflight_lines=len(inflight),
+                inflight_bytes=self.inflight_bytes,
+            )
+        return True
 
     def on_microstep_changed(self):
         self.microstep_dirty = True
@@ -440,10 +530,13 @@ class ScaraSerialMixin:
             self.microstep_dirty = True
             return False
         line = build_ppr_line(ppr)
-        if self.send_ascii_line(line, "PPR"):
+        if self.load_gcode_job([line]):
             self.current_ppr = ppr
             self.microstep_dirty = False
-            self.send_ascii_line("PARAMS", "PARAMS")
+            if hasattr(self, "_reset_jog_anchor"):
+                self._reset_jog_anchor()
+            if hasattr(self, "update_jog_pps_preview"):
+                self.update_jog_pps_preview()
             return True
         return False
 
@@ -462,100 +555,141 @@ class ScaraSerialMixin:
                     if err_match: self.lbl_mcu_err.setText(f"错误码: {err_match.group(1)}")
                     if gbuf_match: self.lbl_mcu_gbuf.setText(f"缓冲区占用: {gbuf_match.group(1)} / 32")
                     # 心跳响应在此处终结，绝对不执行后续运动队列逻辑
-                    return 
+                    return
+
+                if raw.startswith("OK HOME_SENSOR"):
+                    h1_match = re.search(r'h1=(\d+)', raw)
+                    h2_match = re.search(r'h2=(\d+)', raw)
+                    h1 = int(h1_match.group(1)) if h1_match else 0
+                    h2 = int(h2_match.group(1)) if h2_match else 0
+                    if not self.board_only_debug:
+                        self.home_sensor_triggered = (h1 == 1 or h2 == 1)
+                    if hasattr(self, "lbl_mcu_interp"):
+                        self.lbl_mcu_interp.setText(f"HOME_SENSOR h={h1},{h2}")
+                    self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} {raw}</font>")
+                    return
+
+                if raw.startswith("OK ") and not (getattr(self, "inflight_lines", []) or []):
+                    self.waiting_for_ack = False
+                    self.timeout_timer.stop()
+                    self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} [SYSTEM_OK] {raw}</font>")
+                    return
 
                 # 2. 处理运动指令 ACK；系统 OK 只记录，不推进运动队列。
                 if raw.lower().startswith("ok"):
                     ts = self.get_timestamp()
-                    ack = parse_ok_ack(raw, self.last_sent_package.strip())
-
-                    if not (ack.rx_checksum and ack.rx_line):
-                        self.log_display.append(f"<font color='#98c379'>RX {ts} [OK] {raw}</font>")
-                        return
+                    inflight = getattr(self, "inflight_lines", []) or []
+                    ack = parse_ok_ack(raw)
 
                     if not ack.matched:
                         self.log_display.append(
                             f"<font color='orange'>RX {ts} [OUT_OF_BAND_ACK] {raw}</font>"
                         )
-                        self.log_display.append(
-                            f"<font color='orange'>MISMATCH expected_cs={ack.expected_checksum} rx_cs={ack.rx_checksum} expected_line={self.last_sent_package.strip()}</font>"
-                        )
                         return
 
-                    if not self.waiting_for_ack:
+                    if not inflight:
                         self.log_display.append(f"<font color='orange'>RX {ts} [STALE_ACK] {raw}</font>")
                         return
 
-                    self.timeout_timer.stop()
-                    self.waiting_for_ack = False
+                    expected_entry = inflight.pop(0)
+                    expected_line = expected_entry["line"]
+                    self.inflight_bytes = max(
+                        0,
+                        int(getattr(self, "inflight_bytes", 0)) - int(expected_entry.get("bytes", 0)),
+                    )
+                    sent_at = expected_entry.get("sent_at")
+                    ack_id = expected_entry.get("id", self.sent_point_id)
+                    ack_mode = expected_entry.get("mode", getattr(self, "sender_mode", "gcode_stream"))
+                    if str(expected_line).lstrip().upper().startswith("$H"):
+                        self._apply_home_state("done")
+                    self.waiting_for_ack = bool(inflight)
+                    if not self.waiting_for_ack:
+                        self.timeout_timer.stop()
                     self.ack_timeout_count = 0
                     self.stream_waiting_buffer = False
                     self.last_sent_motion = None
+                    if sent_at is not None:
+                        ack_ms = max(0.0, (time.time() - sent_at) * 1000.0)
+                        prev = getattr(self, "avg_ack_ms", None)
+                        self.avg_ack_ms = ack_ms if prev is None else (prev * 0.8 + ack_ms * 0.2)
+                        self._set_sender_status(
+                            ack_mode,
+                            avg_ack_ms=f"{self.avg_ack_ms:.1f}ms",
+                            queued_lines=len(getattr(self, "point_queue", [])),
+                            inflight_lines=len(inflight),
+                            inflight_bytes=int(getattr(self, "inflight_bytes", 0)),
+                        )
 
-                    self.log_display.append(f"<font color='#ffffff'>RX {ts} [ACK {self.sent_point_id}/{self.total_task_points}] {raw}</font>")
-                    self.log_display.append(f"<font color='#00ff99'>MATCH cs={ack.expected_checksum} line=OK</font>")
-                    
-                    # ACK line 是下位机回显的目标命令，不是真实运动反馈；真实反馈只使用状态帧 M:x,y。
+                    self.log_display.append(f"<font color='#ffffff'>RX {ts} [ACK {ack_id}/{self.total_task_points}] {raw}</font>")
+                    self.log_display.append(f"<font color='#00ff99'>MATCH line=OK</font>")
+
+                    # ACK 只确认接收/入队；真实运动反馈只使用状态帧 MPos:x,y。
                     # 只有匹配当前 G-code 的 ACK 才能推进队列，避免 OK ENABLE/OK ZERO 误触发点动发送。
                     self.process_queue()
                     return
 
                 # 3. 处理主动推送的状态包 <...>
                 if raw.startswith('<') and '>' in raw:
+                    self._update_laser_status(raw)
+                    if getattr(self, "velocity_monitor", None) is not None:
+                        self.velocity_monitor.process_mcu_status(raw, getattr(self, "current_ppr", 6400))
+
                     bf_match = re.search(r'Bf:(\d+),(\d+)', raw)
                     if bf_match:
-                        self.mcu_planner_free = int(bf_match.group(2))
+                        self.mcu_planner_free = int(bf_match.group(1))
+                        self.rx_free_hint = int(bf_match.group(2))
+                        self._update_planner_free_hint(self.mcu_planner_free)
                         self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / 32")
                         if self.stream_waiting_buffer and self.mcu_planner_free > 0 and not self.waiting_for_ack:
                             self.stream_waiting_buffer = False
                             QTimer.singleShot(50, self.process_queue)
 
                     q_match = re.search(r'Q:(\d+)', raw)
+                    sq_match = re.search(r'Seg:(\d+),(\d+),(\d+),(\d+)', raw)
+                    if sq_match:
+                        self._set_sender_status(
+                            getattr(self, "sender_mode", "gcode_stream"),
+                            step_segment_count=int(sq_match.group(1)),
+                            step_segment_free=int(sq_match.group(2)),
+                            segment_low_water=int(sq_match.group(3)),
+                            segment_underrun_count=int(sq_match.group(4)),
+                            rx_free=getattr(self, "rx_free_hint", "--"),
+                        )
                     if q_match: self.lbl_mcu_queue.setText(f"队列负载(Q): {q_match.group(1)}")
-
-                    jt_match = re.search(r'JT:([^,|]+),(\d+),(\d+),(\d+),(\d+)', raw)
-                    if jt_match and hasattr(self, "lbl_mcu_interp"):
-                        jt_state = jt_match.group(1)
-                        accepted = int(jt_match.group(2))
-                        executed = int(jt_match.group(3))
-                        queued = int(jt_match.group(4))
-                        free = int(jt_match.group(5))
-                        interp_text = f"插补: {jt_state}  已执行 {executed}/{accepted}\n队列 {queued}  空余 {free}"
-                        ju_match = re.search(r'JU:(\d+),(\d+),(\d+)', raw)
-                        if ju_match:
-                            interp_text += (
-                                f"  欠载 {ju_match.group(1)}t"
-                                f"  间隔 {ju_match.group(2)}t"
-                                f"\n低水 {ju_match.group(3)}"
-                            )
-                        self.lbl_mcu_interp.setText(interp_text)
 
                     hz_match = re.search(r'Hz:(\d+)', raw)
                     if hz_match and hasattr(self, "lbl_mcu_hz"):
                         self.lbl_mcu_hz.setText(f"控制频率: {hz_match.group(1)} Hz")
 
-                    pulse_match = re.search(r'P:([-?\d]+),([-?\d]+)', raw)
+                    pulse_match = re.search(r'JPos:(-?\d+),(-?\d+)', raw)
                     a1_match = re.search(r'A1:(\d+),(\d+),([-?\d]+),([-?\d]+)', raw)
                     a2_match = re.search(r'A2:(\d+),(\d+),([-?\d]+),([-?\d]+)', raw)
                     if pulse_match:
                         self.feedback_p1 = int(pulse_match.group(1))
                         self.feedback_p2 = int(pulse_match.group(2))
+                        if hasattr(self, "_feedback_xy_from_pulses"):
+                            try:
+                                self.cur_x, self.cur_y = self._feedback_xy_from_pulses(
+                                    (self.feedback_p1, self.feedback_p2)
+                                )
+                            except Exception as exc:
+                                self.log_error(f"P: 脉冲正解失败: {exc}")
                     if a1_match:
                         self.feedback_a1_pps = (int(a1_match.group(3)), int(a1_match.group(4)))
                     if a2_match:
                         self.feedback_a2_pps = (int(a2_match.group(3)), int(a2_match.group(4)))
-                    
+
                     h_match = re.search(r'H:(\d),(\d)', raw)
                     if h_match:
                         h1, h2 = int(h_match.group(1)), int(h_match.group(2))
                         if not self.board_only_debug:
                             self.home_sensor_triggered = (h1 == 1 or h2 == 1)
-                        
+
                     hs_match = re.search(r'HS:(\w+)', raw)
-                    if hs_match and hs_match.group(1).lower() == "done": 
-                        self.is_homed = True
-                    
-                    match = re.search(r'M:([-?\d.]+),([-?\d.]+)', raw)
+                    if hs_match:
+                        self._apply_home_state(hs_match.group(1))
+
+                    match = re.search(r'MPos:(-?[\d.]+),(-?[\d.]+)', raw)
                     if match:
                         rx, ry = self.mcu_to_ui_xy(float(match.group(1)), float(match.group(2)))
                         q1, q2 = self.inverse_kinematics(rx, ry)
@@ -580,30 +714,78 @@ class ScaraSerialMixin:
                             self.append_feedback_point(rx, ry)
                         if getattr(self, "velocity_monitor", None) is not None:
                             self.velocity_monitor.process_new_data(f"X{rx:.3f} Y{ry:.3f}")
-                        if self.plot_mode_combo.currentText() == "通讯接收内容":
-                            self.cur_x, self.cur_y = rx, ry
-                            ik = self.inverse_kinematics(rx, ry)
-                            if ik and ik[0] is not None:
-                                self.update_plot(ik[0], ik[1])
-                        else:
-                            self.update_plot()
+                        self.update_plot()
                     return
 
                 # 4. 处理错误报警
-                if "error:" in raw.lower():
+                if raw.startswith("STAT"):
+                    self._update_laser_status(raw)
+                    if getattr(self, "velocity_monitor", None) is not None:
+                        self.velocity_monitor.process_mcu_status(raw, getattr(self, "current_ppr", 6400))
+
+                    tick_match = re.search(r't=(\d+)', raw)
+                    err_match = re.search(r'\be=(\d+)', raw)
+                    bf_match = re.search(r'\bbf=(\d+),(\d+)', raw)
+                    mode_match = re.search(r'\bm=([A-Za-z]+)', raw)
+                    pps_match = re.search(r'\bpps=(-?\d+),(-?\d+)', raw)
+                    tgt_match = re.search(r'\btgt=(-?\d+),(-?\d+)', raw)
+                    en_match = re.search(r'\ben=(\d+),(\d+)', raw)
+                    home_match = re.search(r'\bh=(\d+),(\d+)', raw)
+                    hs_match = re.search(r'\bhs=([A-Za-z0-9_]+)', raw)
+                    he_match = re.search(r'\bhe=(\d+)', raw)
+                    if tick_match:
+                        self.lbl_mcu_tick.setText(f"MCU时间: {tick_match.group(1)} ms")
+                    if err_match:
+                        self.lbl_mcu_err.setText(f"错误码: {err_match.group(1)}")
+                    if bf_match:
+                        self.mcu_planner_free = int(bf_match.group(1))
+                        self.rx_free_hint = int(bf_match.group(2))
+                        self._update_planner_free_hint(self.mcu_planner_free)
+                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / 32")
+                    if home_match and not self.board_only_debug:
+                        self.home_sensor_triggered = (home_match.group(1) == "1" or home_match.group(2) == "1")
+                    if hs_match:
+                        self._apply_home_state(hs_match.group(1))
+                    if hasattr(self, "lbl_mcu_interp") and (hs_match or pps_match or home_match):
+                        mode = mode_match.group(1) if mode_match else "--"
+                        hs = hs_match.group(1) if hs_match else "--"
+                        he = he_match.group(1) if he_match else "--"
+                        en = f"{en_match.group(1)},{en_match.group(2)}" if en_match else "--,--"
+                        pps = f"{pps_match.group(1)},{pps_match.group(2)}" if pps_match else "--,--"
+                        tgt = f"{tgt_match.group(1)},{tgt_match.group(2)}" if tgt_match else "--,--"
+                        h = f"{home_match.group(1)},{home_match.group(2)}" if home_match else "--,--"
+                        self.lbl_mcu_interp.setText(
+                            f"运动:{mode} hs={hs} he={he} en={en} pps={pps} tgt={tgt} h={h}"
+                        )
+                    self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} {raw}</font>")
+                    return
+
+                if "error:" in raw.lower() or raw.upper().startswith("ERR"):
+                    failed_entry = None
+                    inflight = getattr(self, "inflight_lines", []) or []
+                    if inflight:
+                        failed_entry = inflight.pop(0)
+                        self.inflight_bytes = max(
+                            0,
+                            int(getattr(self, "inflight_bytes", 0)) - int(failed_entry.get("bytes", 0)),
+                        )
+                    if failed_entry and str(failed_entry.get("line", "")).lstrip().upper().startswith("$H"):
+                        self._apply_home_state("error")
+                    self.waiting_for_ack = bool(inflight)
                     if raw.lower().startswith("error:8"):
                         self.log_display.append(
                             "<font color='orange'>RX error:8，下位机 pending/buffer 忙；暂停发送、查询状态，不急停。</font>"
                         )
                         self.stream_waiting_buffer = True
-                        self.waiting_for_ack = False
-                        self.timeout_timer.stop()
-                        if self.last_sent_motion is not None:
-                            self.point_queue.insert(0, self.last_sent_motion)
-                            self.last_sent_motion = None
+                        if not self.waiting_for_ack:
+                            self.timeout_timer.stop()
+                        failed_motion = failed_entry.get("motion") if failed_entry else None
+                        if failed_motion is not None:
+                            self.point_queue.insert(0, failed_motion)
                             self.sent_point_id = max(0, self.sent_point_id - 1)
                         if self.ser and self.ser.is_open:
-                            self.ser.write(b"?\n")
+                            self.ser.write(b"?")
+                        self._force_laser_disarm()
                         return
                     self.log_display.append(f"<font color='red'>控制器报警: {raw}</font>")
                     if self.board_only_debug and raw.lower().startswith("error:5"):
@@ -616,22 +798,23 @@ class ScaraSerialMixin:
                         return
                     if raw.lower().startswith("error:15"):
                         self.log_display.append(
-                            "<font color='orange'>运动被下位机拒绝，暂停队列并查询 ERRORS/状态；不自动急停。</font>"
+                            "<font color='orange'>运动被下位机拒绝，已执行软复位并清空流。</font>"
                         )
                         self.point_queue = []
-                        self.waiting_for_ack = False
-                        self.timeout_timer.stop()
-                        self.last_sent_motion = None
+                        self._clear_text_sender_state()
                         self.motion_preamble_needed = True
+                        self._force_laser_disarm()
+                        if self.ser and self.ser.is_open:
+                            self.ser.write(b"\x18")
                         self._request_controller_diagnostics()
                         return
-                    self.emergency_stop()
+                    self.stop_motion()
                     return
 
                 # 5. 其他杂项信息
                 self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} {raw}</font>")
-            except Exception as e: 
-                pass
+            except Exception as exc:
+                self.log_error(f"Serial feedback processing failed: {exc}")
 
     def handle_timeout(self):
         if self.waiting_for_ack and self.ser and self.ser.is_open:
@@ -640,67 +823,68 @@ class ScaraSerialMixin:
                 f"<font color='orange'>等待 ok 超时 {self.ack_timeout_count} 次，查询状态，不重发 G-code</font>"
             )
             self.stream_waiting_buffer = True
-            self.ser.write(b"?\n")
-            self.timeout_timer.start(1500) 
+            if not getattr(self, "inflight_lines", None):
+                self.ser.write(b"?")
+            self.timeout_timer.start(1500)
+
+    def process_gcode_stream(self):
+        return self._fill_ascii_sender_window()
+
+    def process_simulated_queue(self):
+        if not self.point_queue or self.waiting_for_ack:
+            return
+        if (not self.board_only_debug) and self.home_sensor_triggered:
+            self.log_error("Home sensor triggered; simulated queue stopped.")
+            self.point_queue = []
+            return
+        if (not self.board_only_debug) and (not self.is_homed):
+            self.log_error("Not homed; run homing before motion.")
+            self.point_queue = []
+            return
+
+        motion_item = self.point_queue.pop(0)
+        if isinstance(motion_item, str):
+            self._set_sender_status("grbl_stream", queued_lines=len(self.point_queue), inflight_lines=0)
+            QTimer.singleShot(10, self.process_queue)
+            return
+
+        tx, ty, feed_rate = motion_item[0], motion_item[1], motion_item[2]
+        slt = motion_item[3] if len(motion_item) > 3 else False
+        self._set_sender_status("simulated_queue", queued_lines=len(self.point_queue), inflight_lines=0)
+        self.last_sent_motion = (tx, ty, feed_rate, slt)
+        self.sent_point_id += 1
+
+        prev_x, prev_y = self.cur_x, self.cur_y
+        self.cur_x, self.cur_y = tx, ty
+        if slt:
+            self.history_x, self.history_y = [tx], [ty]
+        else:
+            self.history_x.append(tx)
+            self.history_y.append(ty)
+
+        import math as _math
+        dx = tx - prev_x
+        dy = ty - prev_y
+        dist = _math.hypot(dx, dy)
+        feed_mm_s = feed_rate / 60.0
+        dt = dist / feed_mm_s if feed_mm_s > 0.001 else self.dt
+
+        monitor = getattr(self, "velocity_monitor", None)
+        if monitor is not None and hasattr(monitor, "process_tcp_point"):
+            monitor.process_tcp_point(tx, ty, dt)
+
+        ik = self.inverse_kinematics(tx, ty)
+        if ik and ik[0] is not None:
+            self.update_plot(ik[0], ik[1])
+        QTimer.singleShot(10, self.process_queue)
 
     def process_queue(self):
         if getattr(self, "emergency_paused", False):
             return
-        if not self.point_queue or self.waiting_for_ack: return
-        if (not self.board_only_debug) and self.home_sensor_triggered:
-            self.log_error("传感器触发，轨迹终止")
-            self.point_queue = []
-            return
-        if (not self.board_only_debug) and (not self.is_homed) and "$H" not in self.last_sent_package:
-             self.log_error("未回零，请先执行寻原点")
-             self.point_queue = []
-             return
-        motion_item = self.point_queue.pop(0)
-        tx, ty, feed_rate = motion_item[0], motion_item[1], motion_item[2]
-        slt = motion_item[3] if len(motion_item) > 3 else False
-        self.last_sent_motion = (tx, ty, feed_rate, slt)
-        self.sent_point_id += 1
-        mcu_tx, mcu_ty = self.ui_to_mcu_xy(tx, ty)
-        gcode_raw = build_g1_line(mcu_tx, mcu_ty, feed_rate, self.sent_point_id, limit_checked=True)
-        gcode_line = gcode_raw + "\n"
-        self.last_sent_cs = self.calculate_checksum(gcode_raw)
-        self.last_sent_package = gcode_raw
-        if self.plot_mode_combo.currentText() == "通讯发送内容":
-            self.cur_x, self.cur_y = tx, ty
-            if slt: self.history_x, self.history_y = [tx], [ty]
-            else: self.history_x.append(tx); self.history_y.append(ty)
-            ik = self.inverse_kinematics(tx, ty)
-            if ik and ik[0] is not None: self.update_plot(ik[0], ik[1])
-        ts = self.get_timestamp()
-        log_msg = f"TX {ts} [point {self.sent_point_id}/{self.total_task_points}] cs={self.last_sent_cs} len={len(gcode_line)} line={gcode_raw}"
-        self.log_display.append(f"<font color='#ffffff'>{log_msg}</font>")
+        self._flush_pending_laser_power()
         if self.ser and self.ser.is_open:
-            self._write_motion_preamble()
-            self.ser.write(gcode_line.encode('ascii'))
-            self.waiting_for_ack = True  
-            self.timeout_timer.start(1000) 
-        else:
-            # ---- ??????????? / ???????? dt ----
-            prev_x, prev_y = self.cur_x, self.cur_y
-            self.cur_x, self.cur_y = tx, ty
-            if slt:
-                self.history_x, self.history_y = [tx], [ty]
-            else:
-                self.history_x.append(tx)
-                self.history_y.append(ty)
-
-            import math as _math
-            dx = tx - prev_x
-            dy = ty - prev_y
-            dist = _math.hypot(dx, dy)
-            feed_mm_s = feed_rate / 60.0
-            dt = dist / feed_mm_s if feed_mm_s > 0.001 else self.dt
-
-            monitor = getattr(self, "velocity_monitor", None)
-            if monitor is not None and hasattr(monitor, "process_tcp_point"):
-                monitor.process_tcp_point(tx, ty, dt)
-
-            ik = self.inverse_kinematics(tx, ty)
-            if ik and ik[0] is not None:
-                self.update_plot(ik[0], ik[1])
-            QTimer.singleShot(10, self.process_queue)
+            if not self.point_queue:
+                return
+            self.process_gcode_stream()
+            return
+        self.process_simulated_queue()
