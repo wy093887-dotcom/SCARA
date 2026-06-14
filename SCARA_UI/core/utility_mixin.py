@@ -17,6 +17,9 @@ class ScaraUtilityMixin:
         if text in ("?", "!", "~"):
             self.ser.write(text.encode("ascii"))
             return True
+        if hasattr(self, "_line_requires_homing") and self._line_requires_homing(text):
+            self.log_error("Manual motion G-code is blocked; use a formal motion action with a verified preview path.")
+            return False
         if text[0].upper() in ("G", "M", "$") and hasattr(self, "load_gcode_job"):
             append = bool(getattr(self, "waiting_for_ack", False) or getattr(self, "point_queue", None))
             return self.load_gcode_job([text], append=append)

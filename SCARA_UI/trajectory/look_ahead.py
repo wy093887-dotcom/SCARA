@@ -21,6 +21,7 @@ class PlannerPoint:
     feed_mm_min: float
     silent: bool = False
     dt: float = 0.02  # <--- 新增：记录该微小线段的实际耗时(秒)
+    key_point: bool = False
 
 
 @dataclass
@@ -42,6 +43,10 @@ class GeometrySegment:
 
     def point_at(self, distance: float) -> Point2D:
         distance = max(0.0, min(self.length, distance))
+        if distance <= 0.0:
+            return self.start
+        if distance >= self.length:
+            return self.end
         if self.kind == "arc":
             ratio = 0.0 if self.length <= 0.0 else distance / self.length
             angle = self.start_angle + self.delta_angle * ratio
@@ -237,6 +242,46 @@ class LookAheadPlanner:
             delta_angle=delta,
         )
 
+    def arc_segment_3pt(self, p1: Point2D, p2: Point2D, p3: Point2D) -> GeometrySegment:
+        """由三个点(起点 p1、经过点 p2、终点 p3)构造圆弧段。
+
+        圆心取三点外接圆圆心，半径与扫掠方向(顺/逆)完全由三点决定，无需额外的半径
+        或方向参数。三点共线或重合时抛出 ValueError。
+        """
+        ax, ay = float(p1[0]), float(p1[1])
+        bx, by = float(p2[0]), float(p2[1])
+        cx, cy = float(p3[0]), float(p3[1])
+        d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(d) < 1e-9:
+            raise ValueError("三点共线或重合，无法构成圆弧；请调整中间经过点")
+        a_sq = ax * ax + ay * ay
+        b_sq = bx * bx + by * by
+        c_sq = cx * cx + cy * cy
+        ux = (a_sq * (by - cy) + b_sq * (cy - ay) + c_sq * (ay - by)) / d
+        uy = (a_sq * (cx - bx) + b_sq * (ax - cx) + c_sq * (bx - ax)) / d
+        radius = math.hypot(ax - ux, ay - uy)
+        a0 = math.atan2(ay - uy, ax - ux)
+        a_mid = math.atan2(by - uy, bx - ux)
+        a2 = math.atan2(cy - uy, cx - ux)
+        two_pi = 2.0 * math.pi
+        ccw_end = (a2 - a0) % two_pi
+        ccw_mid = (a_mid - a0) % two_pi
+        # 选择能经过中间点 p2 的扫掠方向：逆时针弧覆盖 (0, ccw_end)。
+        if 0.0 < ccw_mid < ccw_end:
+            delta = ccw_end
+        else:
+            delta = ccw_end - two_pi
+        return GeometrySegment(
+            kind="arc",
+            start=(ax, ay),
+            end=(cx, cy),
+            length=abs(delta) * radius,
+            center=(ux, uy),
+            radius=radius,
+            start_angle=a0,
+            delta_angle=delta,
+        )
+
     def rounded_polyline_segments(self, points: List[Point2D], corner_radius_mm: float = 3.0) -> List[GeometrySegment]:
         clean_points = []
         for x, y in points:
@@ -413,7 +458,16 @@ class LookAheadPlanner:
             
             x, y = segment.point_at(next_distance)
             # --- 修改：将 actual_dt 存入数据类 ---
-            points.append(PlannerPoint(x=x, y=y, feed_mm_min=max(1.0, speed * 60.0), silent=silent, dt=actual_dt))
+            points.append(
+                PlannerPoint(
+                    x=x,
+                    y=y,
+                    feed_mm_min=max(1.0, speed * 60.0),
+                    silent=silent,
+                    dt=actual_dt,
+                    key_point=next_distance >= segment.length,
+                )
+            )
             distance = next_distance
             if len(points) > 50000:
                 break

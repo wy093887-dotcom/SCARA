@@ -78,6 +78,7 @@ class FiveBarSerialGUI(
         self.is_recording = False
         self.teach_data = []
         self.teach_points = []
+        self.teach_step_index = 0
         self.point_queue = []
         self.current_ppr = 6400
         self.microstep_dirty = True
@@ -90,9 +91,18 @@ class FiveBarSerialGUI(
         self.error_count = 0
         self.heartbeat_count = 0
         self.ack_timeout_count = 0
-        self.mcu_planner_free = 32
-        self.planner_free_hint = 32
-        self.planner_free_min = 32
+        self.idle_ack_stall_polls = 0
+        self.last_controller_rx_at = 0.0
+        self.last_controller_state = ""
+        self.last_segment_count = 0
+        # Cumulative MCU diagnostics establish a baseline on first status.
+        self.planner_fault_count = None
+        self.rate_limited_segment_count = 0
+        self.serial_failure_reported = False
+        self.mcu_planner_capacity = 48
+        self.mcu_planner_free = self.mcu_planner_capacity
+        self.planner_free_hint = self.mcu_planner_capacity
+        self.planner_free_min = self.mcu_planner_capacity
         self.rx_free_hint = 256
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
@@ -103,6 +113,10 @@ class FiveBarSerialGUI(
         self.laser_arm_sent_at = 0.0
         self.pending_laser_power_permille = None
         self.controller_capabilities = None
+        self.controller_reset_pending = False
+        self.controller_reset_reason = ""
+        self.controller_reset_started_at = 0.0
+        self.controller_reset_generation = 0
         self.emergency_paused = False
         self.active_preview_path = []
         self.jog_target_xy = None

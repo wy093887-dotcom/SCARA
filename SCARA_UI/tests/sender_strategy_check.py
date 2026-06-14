@@ -5,7 +5,12 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from SCARA_UI.communication.motion_senders import GcodeJob, GRBL_GCODE_SENDER, select_motion_sender
+from SCARA_UI.communication.motion_senders import (
+    CountedCommandStream,
+    GcodeJob,
+    GRBL_GCODE_SENDER,
+    select_motion_sender,
+)
 from SCARA_UI.communication.serial_mixin import ScaraSerialMixin
 from SCARA_UI.communication.serial_protocol import parse_ok_ack
 
@@ -25,6 +30,22 @@ def check_bounded_lazy_job():
         job.pop(0)
     assert len(job) == 64
     assert len(generated) == 1064
+
+
+def check_counted_stream_stays_lazy():
+    generated = []
+
+    def commands():
+        for index in range(100000):
+            generated.append(index)
+            yield f"G1 X{index}"
+
+    source = CountedCommandStream(commands(), 100000)
+    assert len(source) == 100000
+    assert not generated
+    job = GcodeJob(source)
+    assert len(job) == 64
+    assert len(generated) == 64
 
 
 def check_single_sender():
@@ -156,35 +177,64 @@ def check_motion_profile_precedes_laser_and_geometry():
 
 def check_motion_line_classification():
     requires_home = ScaraSerialMixin._line_requires_homing
+    long_running = ScaraSerialMixin._line_is_long_running
     assert requires_home("$J=G91 X1 F300")
     assert requires_home("G1 X1 Y2")
+    assert requires_home("G1X1Y2")
     assert requires_home("G03 X1 Y2 I0 J1")
     assert not requires_home("$H")
     assert not requires_home("G20")
     assert not requires_home("G21")
     assert not requires_home("G90")
+    assert long_running("$H")
+    assert long_running(" $hs ")
+    assert not long_running("$X")
+    assert not long_running("G1 X1")
 
 
-def check_segment_accel_quantization():
-    control_hz = 10000
+def check_fixed_character_counting_window():
+    owner = object.__new__(ScaraSerialMixin)
+    owner.rx_free_hint = 1
+    owner.planner_free_hint = 0
+    assert owner._text_sender_limits() == (64, 224)
+
+
+def check_segment_event_fit_converges():
+    """A dense candidate is shortened, not rejected by a PPS-delta gate."""
     ticks = 50
-    accel_step = 5000 * ticks // control_hz
-    pps_quantum = (control_hz + ticks - 1) // ticks
-    assert accel_step == 25
-    assert pps_quantum == 200
-    assert pps_quantum > accel_step
-    assert 2 * pps_quantum <= accel_step + 2 * pps_quantum
+    distance = 1.0
+    events_per_mm = 250.0
+    for _ in range(24):
+        events = round(events_per_mm * distance)
+        if events <= ticks:
+            break
+        distance *= 0.95 * ticks / events
+    assert events <= ticks
+    assert distance > 0.0
+
+
+def check_stream_log_sampling():
+    owner = object.__new__(ScaraSerialMixin)
+    owner.total_task_points = 100000
+    assert owner._should_log_stream_progress(1)
+    assert owner._should_log_stream_progress(20)
+    assert not owner._should_log_stream_progress(21)
+    assert owner._should_log_stream_progress(100)
+    assert owner._should_log_stream_progress(100000)
 
 
 def main():
     check_bounded_lazy_job()
+    check_counted_stream_stays_lazy()
     check_single_sender()
     check_standard_ack()
     check_formal_homing_job()
     check_appended_motion_keeps_formal_preamble()
     check_motion_profile_precedes_laser_and_geometry()
     check_motion_line_classification()
-    check_segment_accel_quantization()
+    check_fixed_character_counting_window()
+    check_segment_event_fit_converges()
+    check_stream_log_sampling()
     print("SENDER_STRATEGY_CHECK PASS")
 
 

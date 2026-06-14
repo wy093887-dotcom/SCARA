@@ -8,6 +8,23 @@ from collections import deque
 from itertools import chain
 
 
+class CountedCommandStream:
+    """One-shot lazy command stream with a known total for UI progress."""
+
+    def __init__(self, commands, count):
+        self._commands = iter(commands)
+        self._count = max(0, int(count))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._commands)
+
+    def __len__(self):
+        return self._count
+
+
 class GcodeJob:
     """Bounded lazy command source used by the GRBL sender."""
 

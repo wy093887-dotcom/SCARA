@@ -10,6 +10,15 @@ from .serial_worker import SerialThreadTransport
 
 
 class ScaraSerialMixin:
+    ACK_TIMEOUT_MS = 1000
+    ACK_RECHECK_MS = 1500
+    HOME_STATUS_POLL_MS = 2000
+    CONTROLLER_SILENCE_LIMIT_S = 6.0
+    IDLE_ACK_STALL_LIMIT_S = 3.0
+    IDLE_ACK_STALL_POLLS = 2
+    STREAM_LOG_FIRST = 20
+    STREAM_LOG_EVERY = 100
+
     def _sender_now(self):
         return time.time()
 
@@ -225,6 +234,22 @@ class ScaraSerialMixin:
 
     def load_motion_gcode_job(self, commands, preview_path=None, append=False):
         """Queue geometry G-code with one GRBL motion profile per new task."""
+        if getattr(self, "controller_reset_pending", False):
+            reason = str(getattr(self, "controller_reset_reason", "") or "controller reset pending")
+            self.log_error(
+                f"Motion blocked: {reason}. Wait for Idle/Q:0/Seg:0/E:0 after Stop/reset before starting a new task."
+            )
+            return False
+        sender_active = bool(self.waiting_for_ack or self.point_queue or getattr(self, "inflight_lines", None))
+        controller_state = str(getattr(self, "last_controller_state", "") or "").lower()
+        if not append and (sender_active or controller_state in ("run", "hold")):
+            self.log_error(
+                f"Motion blocked: current stream/controller is still active ({controller_state or 'pending ACK'}). "
+                "Stop it or wait for Idle before starting a new task."
+            )
+            return False
+        if not self._preflight_motion_path(preview_path):
+            return False
         appending_active_motion = bool(
             append and (self.waiting_for_ack or self.point_queue or getattr(self, "inflight_lines", None))
         )
@@ -237,6 +262,40 @@ class ScaraSerialMixin:
             self.motion_profile_sync_requested = True
             self._begin_laser_task_from_ui()
         return self.load_gcode_job(commands, preview_path=preview_path, append=append)
+
+    def _preflight_motion_path(self, preview_path):
+        """Validate every reusable preview point before any command is queued."""
+        if preview_path is None:
+            self.log_error("Motion blocked: no preflight path was provided.")
+            return False
+        try:
+            iterator = iter(preview_path)
+        except TypeError:
+            self.log_error("Motion blocked: the preflight path is not iterable.")
+            return False
+        if iterator is preview_path:
+            self.log_error(
+                "Motion blocked: the preflight path is a one-shot iterator and cannot be verified before streaming."
+            )
+            return False
+        try:
+            point_count = len(preview_path)
+        except TypeError:
+            point_count = "unknown"
+        if point_count == 0:
+            self.log_error("Motion blocked: the preflight path contains no points.")
+            return False
+        try:
+            valid = self.validate_trajectory_points(preview_path, f"Formal motion path ({point_count} points)")
+        except Exception as exc:
+            self.log_error(f"Motion blocked: preflight traversal failed: {exc}")
+            return False
+        if not valid:
+            return False
+        self.log_display.append(
+            f"<font color='#98c379'>Preflight PASS: verified all {point_count} motion path points.</font>"
+        )
+        return True
 
     def _request_controller_diagnostics(self):
         if self.ser and self.ser.is_open:
@@ -256,6 +315,8 @@ class ScaraSerialMixin:
                 if not port: return
                 self.ser = SerialThreadTransport(port, 115200, self)
                 self.ser.open()
+                self.last_controller_rx_at = time.time()
+                self.serial_failure_reported = False
                 self.serial_status.setText("已连接")
                 self.serial_status.setStyleSheet("color: green;")
                 self.btn_connect.setText("断开")
@@ -278,6 +339,9 @@ class ScaraSerialMixin:
                 pass
             self._reset_laser_task_ui()
             self.ser.close()
+            self.ser = None
+            self.last_controller_state = ""
+            self.last_controller_rx_at = 0.0
             self.heartbeat_timer.stop()
             self.serial_status.setText("未连接")
             self.serial_status.setStyleSheet("color: gray;")
@@ -302,7 +366,7 @@ class ScaraSerialMixin:
             if prepared is None:
                 return
             path, send_path = prepared
-            laser_enabled = self._begin_laser_task_from_ui()
+            laser_enabled = None
         else:
             laser_enabled = bool(getattr(self, "laser_task_active", False))
         self.log_display.append(
@@ -315,7 +379,9 @@ class ScaraSerialMixin:
             append=append,
         )
 
-    def _iter_path_gcode(self, path, laser_enabled=False):
+    def _iter_path_gcode(self, path, laser_enabled=None):
+        if laser_enabled is None:
+            laser_enabled = bool(getattr(self, "laser_task_active", False))
         marking = bool(laser_enabled)
         for point in path:
             x, y = self.ui_to_mcu_xy(float(point[0]), float(point[1]))
@@ -374,6 +440,8 @@ class ScaraSerialMixin:
         low = current.get("segment_low_water", current.get("low_water", "--"))
         underrun = current.get("underrun", current.get("underrun_ticks", "--"))
         underrun_count = current.get("segment_underrun_count", "--")
+        rate_limited = current.get("rate_limited_segments", "--")
+        refill_gap = current.get("max_refill_gap_ms", "--")
         free_min = current.get("planner_free_min", getattr(self, "planner_free_min", "--"))
         if free_min is None:
             free_min = "--"
@@ -381,7 +449,7 @@ class ScaraSerialMixin:
         status_text = (
             f"Sender: {self.sender_mode}  queued={queued} inflight={inflight} "
             f"free={free}/{rx_free} min={free_min} sq={step_count}/{step_free} "
-            f"low={low} underrun={underrun}/{underrun_count} avg_ack={ack_ms}"
+            f"low={low} underrun={underrun}/{underrun_count} rl={rate_limited} gap={refill_gap}ms avg_ack={ack_ms}"
         )
         label = getattr(self, "lbl_sender_mode", None)
         if label is not None:
@@ -395,6 +463,30 @@ class ScaraSerialMixin:
         self.waiting_for_ack = False
         self.last_sent_motion = None
         self.planner_free_min = None
+        self.ack_timeout_count = 0
+        self.idle_ack_stall_polls = 0
+
+    def _begin_controller_reset(self, reason):
+        self.controller_reset_pending = True
+        self.controller_reset_reason = str(reason)
+        self.controller_reset_started_at = time.time()
+        self.controller_reset_generation = int(getattr(self, "controller_reset_generation", 0)) + 1
+
+    def _finish_controller_reset(self, raw=None):
+        if not getattr(self, "controller_reset_pending", False):
+            return
+        age = max(0.0, time.time() - float(getattr(self, "controller_reset_started_at", 0.0) or 0.0))
+        reason = str(getattr(self, "controller_reset_reason", "") or "controller reset")
+        self.controller_reset_pending = False
+        self.controller_reset_reason = ""
+        self.controller_reset_started_at = 0.0
+        self.motion_preamble_needed = True
+        self.motion_profile_sync_requested = False
+        self.timeout_timer.stop()
+        detail = f" status={raw}" if raw else ""
+        self.log_display.append(
+            f"<font color='#98c379'>Controller reset drain complete after {age:.1f}s: {reason}.{detail}</font>"
+        )
 
     def _update_planner_free_hint(self, free):
         free = max(0, int(free))
@@ -404,13 +496,9 @@ class ScaraSerialMixin:
         return free
 
     def _text_sender_limits(self):
-        planner_free = getattr(self, "planner_free_hint", getattr(self, "mcu_planner_free", None))
-        max_lines = 64
-        rx_free = getattr(self, "rx_free_hint", None)
-        max_bytes = 224
-        if isinstance(rx_free, int):
-            max_bytes = max(32, min(max_bytes, rx_free - 16))
-        return max_lines, max_bytes
+        # Grbl character-counting streaming owns one fixed outstanding-byte
+        # window. Bf RX-free is a diagnostic snapshot, not a new credit grant.
+        return 64, 224
 
     def _line_from_motion_item(self, motion_item):
         if isinstance(motion_item, str):
@@ -442,7 +530,68 @@ class ScaraSerialMixin:
     @staticmethod
     def _line_requires_homing(line):
         text = str(line).lstrip().upper()
-        return text.startswith("$J=") or re.match(r"^G0?[0-3](?:\s|$)", text) is not None
+        return text.startswith("$J=") or re.match(r"^G0?[0-3](?=[^0-9]|$)", text) is not None
+
+    @staticmethod
+    def _line_is_long_running(line):
+        return str(line).strip().upper() in ("$H", "$HS")
+
+    def _oldest_inflight_entry(self):
+        inflight = getattr(self, "inflight_lines", None) or []
+        return inflight[0] if inflight else None
+
+    def _should_log_stream_progress(self, line_id):
+        line_id = int(line_id)
+        total = int(getattr(self, "total_task_points", 0) or 0)
+        return (
+            line_id <= self.STREAM_LOG_FIRST
+            or line_id % self.STREAM_LOG_EVERY == 0
+            or (total > 0 and line_id >= total)
+        )
+
+    def _restart_ack_timer(self):
+        oldest = self._oldest_inflight_entry()
+        if oldest is None:
+            self.timeout_timer.stop()
+            return
+        delay = self.HOME_STATUS_POLL_MS if self._line_is_long_running(oldest.get("line", "")) else self.ACK_TIMEOUT_MS
+        self.timeout_timer.start(delay)
+
+    def _abort_stalled_stream(self, reason, reset_controller=True):
+        oldest = self._oldest_inflight_entry()
+        line = oldest.get("line", "") if oldest else ""
+        age = max(0.0, time.time() - float(oldest.get("sent_at", time.time()))) if oldest else 0.0
+        self.log_error(f"{reason}; oldest pending line age={age:.1f}s line={line!r}. Stream cleared.")
+        queue = getattr(self, "point_queue", None)
+        if hasattr(queue, "clear"):
+            queue.clear()
+        else:
+            self.point_queue = []
+        self._clear_text_sender_state()
+        self.stream_waiting_buffer = False
+        self.last_sent_motion = None
+        self.active_preview_path = []
+        self.motion_preamble_needed = True
+        self.motion_profile_sync_requested = False
+        self.timeout_timer.stop()
+        if reset_controller:
+            self._begin_controller_reset(reason)
+        if hasattr(self, "_force_laser_disarm"):
+            self._force_laser_disarm()
+        if reset_controller and self.ser and self.ser.is_open:
+            self.ser.write(b"\x18")
+            self.ser.write(b"?")
+
+    def _check_serial_transport_error(self):
+        transport = getattr(self, "ser", None)
+        error = getattr(transport, "error", None) if transport is not None else None
+        if error is None:
+            self.serial_failure_reported = False
+            return False
+        if not getattr(self, "serial_failure_reported", False):
+            self.serial_failure_reported = True
+            self._abort_stalled_stream(f"Serial worker stopped: {error}", reset_controller=False)
+        return True
 
     def _fill_ascii_sender_window(self):
         if not self.ser or not self.ser.is_open:
@@ -458,11 +607,16 @@ class ScaraSerialMixin:
         max_lines, max_bytes = self._text_sender_limits()
         sent_any = False
         while self.point_queue and len(inflight) < max_lines:
+            if inflight and self._line_is_long_running(inflight[0].get("line", "")):
+                break
             motion_item = self.point_queue[0]
             gcode_raw, mode, motion_record = self._line_from_motion_item(motion_item)
             if not gcode_raw:
                 self.point_queue.pop(0)
                 continue
+            long_running = self._line_is_long_running(gcode_raw)
+            if long_running and inflight:
+                break
             if not self.board_only_debug and self._line_requires_homing(gcode_raw):
                 if self.home_sensor_triggered:
                     self.log_error("Home switch is active; motion stream stopped.")
@@ -487,7 +641,8 @@ class ScaraSerialMixin:
                 f"TX {ts} [{tag} {self.sent_point_id}/{self.total_task_points}] "
                 f"len={line_bytes} line={gcode_raw}"
             )
-            self.log_display.append(f"<font color='#ffffff'>{log_msg}</font>")
+            if self._should_log_stream_progress(self.sent_point_id):
+                self.log_display.append(f"<font color='#ffffff'>{log_msg}</font>")
             self.ser.write((gcode_raw + "\n").encode("ascii"))
             entry = {
                 "line": gcode_raw,
@@ -500,10 +655,12 @@ class ScaraSerialMixin:
             inflight.append(entry)
             self.inflight_bytes = int(getattr(self, "inflight_bytes", 0)) + line_bytes
             sent_any = True
+            if long_running:
+                break
 
         if inflight:
             self.waiting_for_ack = True
-            self.timeout_timer.start(1000)
+            self._restart_ack_timer()
             self._set_sender_status(
                 inflight[0].get("mode", "gcode_stream"),
                 queued_lines=len(self.point_queue),
@@ -541,10 +698,15 @@ class ScaraSerialMixin:
         return False
 
     def check_serial_feedback(self):
+        if self._check_serial_transport_error():
+            return
         if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
             try:
                 raw = self.ser.readline().decode('ascii', errors='ignore').strip()
                 if not raw: return
+                self.last_controller_rx_at = time.time()
+                if self.ser.in_waiting > 0:
+                    QTimer.singleShot(0, self.check_serial_feedback)
 
                 # 1. 独立处理下位机健康监控反馈 (心跳 OK)
                 if raw.startswith("OK HEARTBEAT"):
@@ -553,7 +715,9 @@ class ScaraSerialMixin:
                     gbuf_match = re.search(r'gbuf=\d+,(\d+)', raw)
                     if tick_match: self.lbl_mcu_tick.setText(f"MCU时间: {tick_match.group(1)} ms")
                     if err_match: self.lbl_mcu_err.setText(f"错误码: {err_match.group(1)}")
-                    if gbuf_match: self.lbl_mcu_gbuf.setText(f"缓冲区占用: {gbuf_match.group(1)} / 32")
+                    if gbuf_match:
+                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
+                        self.lbl_mcu_gbuf.setText(f"缓冲区占用: {gbuf_match.group(1)} / {capacity}")
                     # 心跳响应在此处终结，绝对不执行后续运动队列逻辑
                     return
 
@@ -570,6 +734,11 @@ class ScaraSerialMixin:
                     return
 
                 if raw.startswith("OK ") and not (getattr(self, "inflight_lines", []) or []):
+                    if getattr(self, "controller_reset_pending", False):
+                        self.log_display.append(
+                            f"<font color='orange'>RX {self.get_timestamp()} [STALE_POST_RESET] {raw}</font>"
+                        )
+                        return
                     self.waiting_for_ack = False
                     self.timeout_timer.stop()
                     self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} [SYSTEM_OK] {raw}</font>")
@@ -580,6 +749,10 @@ class ScaraSerialMixin:
                     ts = self.get_timestamp()
                     inflight = getattr(self, "inflight_lines", []) or []
                     ack = parse_ok_ack(raw)
+
+                    if getattr(self, "controller_reset_pending", False) and not inflight:
+                        self.log_display.append(f"<font color='orange'>RX {ts} [STALE_POST_RESET] {raw}</font>")
+                        return
 
                     if not ack.matched:
                         self.log_display.append(
@@ -620,8 +793,11 @@ class ScaraSerialMixin:
                             inflight_bytes=int(getattr(self, "inflight_bytes", 0)),
                         )
 
-                    self.log_display.append(f"<font color='#ffffff'>RX {ts} [ACK {ack_id}/{self.total_task_points}] {raw}</font>")
-                    self.log_display.append(f"<font color='#00ff99'>MATCH line=OK</font>")
+                    if self._should_log_stream_progress(ack_id):
+                        self.log_display.append(
+                            f"<font color='#ffffff'>RX {ts} [ACK {ack_id}/{self.total_task_points}] {raw}</font>"
+                        )
+                        self.log_display.append(f"<font color='#00ff99'>MATCH line=OK</font>")
 
                     # ACK 只确认接收/入队；真实运动反馈只使用状态帧 MPos:x,y。
                     # 只有匹配当前 G-code 的 ACK 才能推进队列，避免 OK ENABLE/OK ZERO 误触发点动发送。
@@ -631,6 +807,9 @@ class ScaraSerialMixin:
                 # 3. 处理主动推送的状态包 <...>
                 if raw.startswith('<') and '>' in raw:
                     self._update_laser_status(raw)
+                    mode_match = re.match(r'<([^|>]+)', raw)
+                    if mode_match:
+                        self.last_controller_state = mode_match.group(1).strip().lower()
                     if getattr(self, "velocity_monitor", None) is not None:
                         self.velocity_monitor.process_mcu_status(raw, getattr(self, "current_ppr", 6400))
 
@@ -639,14 +818,18 @@ class ScaraSerialMixin:
                         self.mcu_planner_free = int(bf_match.group(1))
                         self.rx_free_hint = int(bf_match.group(2))
                         self._update_planner_free_hint(self.mcu_planner_free)
-                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / 32")
+                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
+                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / {capacity}")
                         if self.stream_waiting_buffer and self.mcu_planner_free > 0 and not self.waiting_for_ack:
                             self.stream_waiting_buffer = False
                             QTimer.singleShot(50, self.process_queue)
 
                     q_match = re.search(r'Q:(\d+)', raw)
+                    if bf_match and q_match:
+                        self.mcu_planner_capacity = int(bf_match.group(1)) + int(q_match.group(1))
                     sq_match = re.search(r'Seg:(\d+),(\d+),(\d+),(\d+)', raw)
                     if sq_match:
+                        self.last_segment_count = int(sq_match.group(1))
                         self._set_sender_status(
                             getattr(self, "sender_mode", "gcode_stream"),
                             step_segment_count=int(sq_match.group(1)),
@@ -654,6 +837,40 @@ class ScaraSerialMixin:
                             segment_low_water=int(sq_match.group(3)),
                             segment_underrun_count=int(sq_match.group(4)),
                             rx_free=getattr(self, "rx_free_hint", "--"),
+                        )
+                    pf_match = re.search(r'Pf:(\d+)', raw)
+                    if pf_match:
+                        fault_count = int(pf_match.group(1))
+                        previous_fault_count = getattr(self, "planner_fault_count", None)
+                        self.planner_fault_count = fault_count
+                        if previous_fault_count is not None and fault_count > int(previous_fault_count):
+                            stream_active = bool(
+                                self.waiting_for_ack
+                                or self.point_queue
+                                or getattr(self, "inflight_lines", None)
+                                or str(getattr(self, "last_controller_state", "")).lower() in ("run", "hold")
+                            )
+                            if stream_active and not getattr(self, "controller_reset_pending", False):
+                                self._abort_stalled_stream(
+                                    f"Controller planner segment preparation fault count increased to {fault_count}"
+                                )
+                                return
+                            self.log_display.append(
+                                f"<font color='orange'>Planner preparation fault counter advanced while idle: "
+                                f"{previous_fault_count} -> {fault_count}; stream was not cleared.</font>"
+                            )
+                    rl_match = re.search(r'Rl:(\d+)', raw)
+                    if rl_match:
+                        self.rate_limited_segment_count = int(rl_match.group(1))
+                        self._set_sender_status(
+                            getattr(self, "sender_mode", "gcode_stream"),
+                            rate_limited_segments=self.rate_limited_segment_count,
+                        )
+                    pg_match = re.search(r'Pg:(\d+)', raw)
+                    if pg_match:
+                        self._set_sender_status(
+                            getattr(self, "sender_mode", "gcode_stream"),
+                            max_refill_gap_ms=int(pg_match.group(1)),
                         )
                     if q_match: self.lbl_mcu_queue.setText(f"队列负载(Q): {q_match.group(1)}")
 
@@ -688,6 +905,20 @@ class ScaraSerialMixin:
                     hs_match = re.search(r'HS:(\w+)', raw)
                     if hs_match:
                         self._apply_home_state(hs_match.group(1))
+
+                    if getattr(self, "controller_reset_pending", False):
+                        q_zero = re.search(r'\bQ:(\d+)', raw)
+                        e_zero = re.search(r'\bE:(\d+)', raw)
+                        seg_zero = re.search(r'\bSeg:(\d+),', raw)
+                        if (
+                            str(getattr(self, "last_controller_state", "") or "").lower() == "idle"
+                            and q_zero and int(q_zero.group(1)) == 0
+                            and e_zero and int(e_zero.group(1)) == 0
+                            and seg_zero and int(seg_zero.group(1)) == 0
+                            and not (getattr(self, "inflight_lines", []) or [])
+                            and not getattr(self, "point_queue", [])
+                        ):
+                            self._finish_controller_reset(raw)
 
                     match = re.search(r'MPos:(-?[\d.]+),(-?[\d.]+)', raw)
                     if match:
@@ -726,7 +957,10 @@ class ScaraSerialMixin:
                     tick_match = re.search(r't=(\d+)', raw)
                     err_match = re.search(r'\be=(\d+)', raw)
                     bf_match = re.search(r'\bbf=(\d+),(\d+)', raw)
+                    q_match = re.search(r'\bq=(\d+)', raw)
                     mode_match = re.search(r'\bm=([A-Za-z]+)', raw)
+                    if mode_match:
+                        self.last_controller_state = mode_match.group(1).strip().lower()
                     pps_match = re.search(r'\bpps=(-?\d+),(-?\d+)', raw)
                     tgt_match = re.search(r'\btgt=(-?\d+),(-?\d+)', raw)
                     en_match = re.search(r'\ben=(\d+),(\d+)', raw)
@@ -740,8 +974,14 @@ class ScaraSerialMixin:
                     if bf_match:
                         self.mcu_planner_free = int(bf_match.group(1))
                         self.rx_free_hint = int(bf_match.group(2))
+                        if q_match:
+                            self.mcu_planner_capacity = self.mcu_planner_free + int(q_match.group(1))
                         self._update_planner_free_hint(self.mcu_planner_free)
-                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / 32")
+                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
+                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / {capacity}")
+                    sq_match = re.search(r'\bsq=(\d+),(\d+)', raw)
+                    if sq_match:
+                        self.last_segment_count = int(sq_match.group(1))
                     if home_match and not self.board_only_debug:
                         self.home_sensor_triggered = (home_match.group(1) == "1" or home_match.group(2) == "1")
                     if hs_match:
@@ -763,6 +1003,19 @@ class ScaraSerialMixin:
                 if "error:" in raw.lower() or raw.upper().startswith("ERR"):
                     failed_entry = None
                     inflight = getattr(self, "inflight_lines", []) or []
+                    if (
+                        raw.lower().startswith("error:15")
+                        and inflight
+                        and self._line_is_long_running(inflight[0].get("line", ""))
+                    ):
+                        self.log_display.append(
+                            "<font color='orange'>Ignored stale error:15 while homing is pending; "
+                            "$H/$HS cannot generate a planner path error. Querying status.</font>"
+                        )
+                        if self.ser and self.ser.is_open:
+                            self.ser.write(b"?")
+                        self._restart_ack_timer()
+                        return
                     if inflight:
                         failed_entry = inflight.pop(0)
                         self.inflight_bytes = max(
@@ -797,15 +1050,15 @@ class ScaraSerialMixin:
                         self.timeout_timer.stop()
                         return
                     if raw.lower().startswith("error:15"):
+                        if getattr(self, "controller_reset_pending", False) and not inflight:
+                            self.log_display.append(
+                                f"<font color='orange'>RX {self.get_timestamp()} [STALE_POST_RESET] {raw}</font>"
+                            )
+                            return
                         self.log_display.append(
-                            "<font color='orange'>运动被下位机拒绝，已执行软复位并清空流。</font>"
+                            "<font color='orange'>运动被下位机拒绝，正在执行软复位并等待 Idle/Q:0/Seg:0/E:0。</font>"
                         )
-                        self.point_queue = []
-                        self._clear_text_sender_state()
-                        self.motion_preamble_needed = True
-                        self._force_laser_disarm()
-                        if self.ser and self.ser.is_open:
-                            self.ser.write(b"\x18")
+                        self._abort_stalled_stream("Controller rejected motion with error:15")
                         self._request_controller_diagnostics()
                         return
                     self.stop_motion()
@@ -817,15 +1070,63 @@ class ScaraSerialMixin:
                 self.log_error(f"Serial feedback processing failed: {exc}")
 
     def handle_timeout(self):
-        if self.waiting_for_ack and self.ser and self.ser.is_open:
-            self.ack_timeout_count += 1
-            self.log_display.append(
-                f"<font color='orange'>等待 ok 超时 {self.ack_timeout_count} 次，查询状态，不重发 G-code</font>"
+        if not self.waiting_for_ack:
+            return
+        if self._check_serial_transport_error():
+            return
+        if not self.ser or not self.ser.is_open:
+            self._abort_stalled_stream("Serial link closed while waiting for controller ACK", reset_controller=False)
+            return
+
+        oldest = self._oldest_inflight_entry()
+        if oldest is None:
+            self._clear_text_sender_state()
+            self.timeout_timer.stop()
+            return
+
+        self.ack_timeout_count += 1
+        line = oldest.get("line", "")
+        age = max(0.0, time.time() - float(oldest.get("sent_at", time.time())))
+        if self._line_is_long_running(line):
+            if self.ack_timeout_count == 1 or self.ack_timeout_count % 10 == 0:
+                self.log_display.append(
+                    f"<font color='#bbbbbb'>Homing in progress: waiting {age:.1f}s for {line} completion ACK.</font>"
+                )
+            self.ser.write(b"?")
+            self.timeout_timer.start(self.HOME_STATUS_POLL_MS)
+            return
+
+        self.stream_waiting_buffer = True
+        self.ser.write(b"?")
+        state = str(getattr(self, "last_controller_state", "") or "").lower()
+        last_rx_at = float(getattr(self, "last_controller_rx_at", 0.0) or 0.0)
+        controller_age = max(0.0, time.time() - last_rx_at) if last_rx_at > 0.0 else 0.0
+        planner_free = int(getattr(self, "mcu_planner_free", 0) or 0)
+        segment_count = int(getattr(self, "last_segment_count", 0) or 0)
+        capacity = int(getattr(self, "mcu_planner_capacity", 48) or 48)
+        idle_empty = state == "idle" and planner_free >= capacity and segment_count == 0
+        if idle_empty and age >= self.IDLE_ACK_STALL_LIMIT_S:
+            self.idle_ack_stall_polls = int(getattr(self, "idle_ack_stall_polls", 0)) + 1
+        else:
+            self.idle_ack_stall_polls = 0
+
+        if last_rx_at > 0.0 and controller_age >= self.CONTROLLER_SILENCE_LIMIT_S:
+            self._abort_stalled_stream(
+                f"Controller produced no feedback for {controller_age:.1f}s while an ACK was pending"
             )
-            self.stream_waiting_buffer = True
-            if not getattr(self, "inflight_lines", None):
-                self.ser.write(b"?")
-            self.timeout_timer.start(1500)
+            return
+        if self.idle_ack_stall_polls >= self.IDLE_ACK_STALL_POLLS:
+            self._abort_stalled_stream(
+                "Controller is Idle with an empty planner/segment queue but a G-code ACK is still pending"
+            )
+            return
+
+        if self.ack_timeout_count == 1 or self.ack_timeout_count % 10 == 0:
+            self.log_display.append(
+                f"<font color='orange'>Waiting for ok ({age:.1f}s, controller={state or 'unknown'}); "
+                "queried status and did not resend G-code.</font>"
+            )
+        self.timeout_timer.start(self.ACK_RECHECK_MS)
 
     def process_gcode_stream(self):
         return self._fill_ascii_sender_window()
@@ -882,9 +1183,12 @@ class ScaraSerialMixin:
         if getattr(self, "emergency_paused", False):
             return
         self._flush_pending_laser_power()
-        if self.ser and self.ser.is_open:
-            if not self.point_queue:
+        if self.ser is not None:
+            if self._check_serial_transport_error():
                 return
-            self.process_gcode_stream()
+            if self.ser.is_open:
+                if not self.point_queue:
+                    return
+                self.process_gcode_stream()
             return
         self.process_simulated_queue()
